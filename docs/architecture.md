@@ -18,8 +18,9 @@
 | 路由 | `src/server/routes.ts` | 四个端点（status / check / releases / upgrade）+ 请求门（方法、`x-dsh-upgrade:1`、同源 Origin）+ NDJSON 进度；status 与 check 都读 last.json，把「装完没重启」报成 `restartRequired`（重查不会把它抹掉）；注册走 `ctx.effect` + `webServer.register` | `index`；页面与 agent 经 HTTP 调用 |
 | 工具 | `src/server/tools.ts` | 两个 agent 工具：`dsh_upgrade_check`（只读）与 `dsh_upgrade`（会动安装目录）；成功后写 last.json 的 `restartRequired` 并只回这个标记，不写 pending、不自己重启 | `index` 注册；agent 调用 |
 | 市场适配 | `src/client/market.ts` | 浏览器侧适配 dshmarket v1 的 summary / start / poll 协议，纯映射，按 code 区分市场不可用 / 操作用未知 / 未授权 / 更新失败；running 时带回 `progress`（percent/detail，只给 done/total 时自己折算）与 `wait`（排队原因）；兜底文案 `UNAVAILABLE_MESSAGE` 对外导出，批量队列复用同一句 | `panel`、`batch` |
+| 批量升级 | `src/client/batch.ts` | 串行执行全部可更新插件：按顺序 POST 起包、GET 轮询、3 分钟没有推进就判卡住、单包失败 / 回滚 / 卡住后继续下一个，宿主 409 或叫停时把剩余记成 skipped 提前收尾，汇总 succeeded / failed / skipped 与 restartRequired；只发事件，不碰 DOM | `panel` |
 | 注入 | `src/client/inject.ts` | 在底栏挂升级图标：三级退路（dshmarket 底栏 → sidebar.footer → settings.launcher）+ MutationObserver 重挂 | `src/client/index.ts` |
-| 面板 | `src/client/panel.ts` | 两段式面板：当前 / 可升级版本、更新内容折叠、NDJSON 进度；外壳不滚，`.dshu-head` 固定、只有 `.dshu-body` 滚动；本体阶段条按 `PHASE_LABELS` 顺序折算百分比，插件行各自带进度条与**行内**失败原因（不往底部抛红条，长文压成中文首句、全文进 title）；操作 3 分钟没有任何推进就解锁按钮并写明卡在哪（等会话结束 / 还在后台跑），不把按钮钉死；升级完成后调 dsh-restart 的 precheck → restart，404 时提示手动重启；status 报 `restartRequired` 时提示「需重启」而不是「已是最新」 | `src/client/index.ts` |
+| 面板 | `src/client/panel.ts` | 两段式面板：当前 / 可升级版本、更新内容折叠、NDJSON 进度；外壳不滚，`.dshu-head` 固定、只有 `.dshu-body` 滚动；本体阶段条按 `PHASE_LABELS` 顺序折算百分比；插件段一个「全部升级」按钮 + 两行式插件行（第一行名字 / 版本，第二行自己的进度条与**行内**文案，单包升级按钮已移除）+ 结束后的「重启 DSH」按钮（二次确认）；行内失败原因不往底部抛红条，长文压成中文首句、全文进 title；操作 3 分钟没有任何推进就解锁按钮并写明卡在哪（等会话结束 / 还在后台跑），不把按钮钉死；升级完成后调 dsh-restart 的 precheck → restart，404 时提示手动重启；status 报 `restartRequired` 时提示「需重启」而不是「已是最新」 | `src/client/index.ts` |
 | 客户端入口 | `src/client/index.ts` | 浏览器入口 `apply`：挂图标 → 拉一次 status 决定提示 → 打开面板；卸载时 teardown | 宿主客户端插件加载器 |
 
 ## 数据流
@@ -27,6 +28,10 @@
 ### 浏览器 → 服务端
 
 点底栏图标 → `panel` 先 GET `/dsh-upgrade/api/status`（带 `x-dsh-upgrade:1`）拿当前 / 目标版本；POST `/check` 与 GET `/releases` 只刷新展示；点「升级」POST `/upgrade`，读回 NDJSON 进度（precheck / backup / install / verify / done / fail）。
+
+### 插件：全部升级 → runBatch → dshmarket → 汇总 → 可选重启
+
+点「全部升级」→ `panel.startBatch` 先把每行按 `pending` 清空（上一轮文案不残留）→ `runBatch(names)` 串行：`POST /dsh-market/api/v1/updates {packageName}` 拿 operationId，随后每 `DEFAULT_POLL_INTERVAL_MS`（800ms）`GET /dsh-market/api/v1/operations/<id>`；非终态发 `running`（percent / detail / 排队原因），终态发 `settled`，一个包到终态才起下一个 → `panel` 只按 `item.name` 把事件画到对应行（`paintBatchItem`）→ 结束后写汇总「n 个已升级，m 个失败，k 个跳过（，需重启生效）」，并按 `summary.skipped` 给对应行补「已跳过」（batch 对跳过项不发事件）→ 有成功项时 `offerRestart`：`GET /dsh-restart/api/status` 200 露出「重启 DSH」，404 提示手动重启，其它状态码写明 HTTP 码 → 点按钮第一下只进「确认重启？」，第二下才走 precheck → restart。
 
 ### 服务端 → 本机安装目录
 
@@ -38,7 +43,7 @@
 
 ### 服务端 → dsh-restart
 
-升级成功后 `panel` 先 POST `/dsh-restart/api/precheck`（NDJSON）再 POST `/dsh-restart/api/restart`，让服务带着新版本重启；404（没装 dsh-restart）则显示「已升级，需手动重启」，不假装成功。
+本体升级成功后 `panel` 先 POST `/dsh-restart/api/precheck`（NDJSON）再 POST `/dsh-restart/api/restart`，让服务带着新版本重启；404（没装 dsh-restart）则显示「已升级，需手动重启」，不假装成功。插件批量走同一条链：有成功项时先 GET `/dsh-restart/api/status` 决定露不露「重启 DSH」按钮，点了才 precheck → restart。
 
 ## 关键约束
 
@@ -48,6 +53,12 @@
 - 升级单飞：HTTP 与 agent 工具共用一把锁，第二个请求回 409 BUSY。
 - 备份没成功就不进入安装；回滚顺序固定 removeDir → moveDir。
 - 运行期零第三方依赖：服务端只用 Node 内置与宿主注入能力，客户端只用浏览器 API 与 dshmarket v1 协议。
+- 插件批量只串行：dshmarket 没有批量端点，同一时刻只允许一个活动操作 —— 一个包到终态才起下一个；单包失败 / 回滚 / 卡住只记在自己名下，继续后面的包；只有 `cancelled()` 或宿主 `OPERATION_BUSY` 才把剩余记成 skipped 并立即收尾（R32/R40，409 不连报 N 次）。
+- 文案归数据层，样式归视图层（R30）：`batch.ts` 决定 `message` 与 `unavailable`，`paintBatchItem` 只做 `compactReason` 与红字判定（`failed && !unavailable`）；running 文案按 `message ?? detail ?? '正在升级…N%'`（R36），终态 `message` 已是完整句时不再补「升级失败：」（R38/R42），排队 / 卡住不上红字。
+- 行内进度的显隐必须切整个 `.dshu-plugin-progress`（R41）：只切 `.dshu-bar` 会让进度永远不可见；`percent === null` 时画不确定进度，不假装 0%。
+- `runBatch` 自身不抛：网络异常由 `pollPluginOperation` 收敛成结果对象，`onEvent` 抛错由 `emit` 内部吞掉 —— 单行绘制失败不能打断整批。
+- 批后不刷新插件列表（R47 已知边界）：names 是点击瞬间的快照，再点一次会把已升级的包重新 POST；本轮接受，先关面板重开再看。
+- 关闭面板只叫停队列（`cancelled: () => view.closed` 只在每包起包前查一次）：在飞的包仍轮询到终态，结果因 `live()` 为假被丢弃；立刻重开可能撞宿主 `OPERATION_BUSY`。
 
 ## 维护
 

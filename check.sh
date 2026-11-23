@@ -1,6 +1,6 @@
 #!/bin/sh
 # 一条命令判断对不对。绿 = 全部通过，红 = 有东西坏了。
-# ①②③ 是骨架自带的；④ 是你的项目检查命令，现在还没配。
+# ①②③ 是骨架自带的；④ 是项目的构建 / 类型 / 测试验收（含产物与用例数下限）。
 cd "$(dirname "$0")" || exit 1
 fail=0
 bad() { printf '✗ %s\n' "$1" >&2; fail=1; }
@@ -34,8 +34,19 @@ done
 
 # ④ 构建 / 类型检查 / 测试，一条挂了不挡其它条
 npm run build || bad "构建失败"
+# lib/index.js 与 lib/client.js 是 package.json exports 和安装脚本 REQUIRED_ARTIFACTS 的承诺：tsup 静默少产物要红
+for a in lib/index.js lib/client.js; do
+  [ -f "$a" ] || bad "构建产物缺失: ${a}"
+done
 npx tsc --noEmit || bad "类型检查失败"
-npm test || bad "测试失败"
+# 先收下输出：既原样打印，也数一遍用例数（防整批用例被删还报绿；下限 222 = 208 + 批量升级至少 14 条）
+test_out=$(npm test 2>&1); test_rc=$?
+printf '%s\n' "$test_out"
+[ "$test_rc" -eq 0 ] || bad "测试失败"
+passed=$(printf '%s\n' "$test_out" | grep -oE 'Tests +[0-9]+ passed' | grep -oE '[0-9]+' | head -1)
+if [ -n "$passed" ] && [ "$passed" -lt 222 ]; then
+  bad "只跑了 ${passed} 个用例，少于 222（批量升级至少应有 222 条）"
+fi
 
 if [ "$fail" -eq 0 ]; then echo '✓ 全部通过'; else echo '✗ 有未通过项' >&2; fi
 exit "$fail"

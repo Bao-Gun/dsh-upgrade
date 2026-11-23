@@ -32,7 +32,7 @@
 
 ## 命令
 
-- 启动：`node scripts/install.mjs --apply`（先在仓库 `npm run build`；不加 `--apply` 只 dry-run）
+- 启动：`npm run build && node scripts/install.mjs --apply`（装进 web profile 后重启 dsh web；只跑 `node scripts/install.mjs` 是 dry-run）
 - 检查：`bash check.sh`（唯一判断对错的方式，别靠肉眼）。收尾要贴出退出码和结果行再说完成。
 - 并行开发：工作树放 `.worktrees/`（已在忽略列表）。有 harness 原生 worktree 工具就用它，别手搓 `git worktree`。
 
