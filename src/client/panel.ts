@@ -119,7 +119,7 @@ const STYLE_TEXT = [
   '.dshu-plugins-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0}',
   '.dshu-plugins-head h3{margin:0}',
   '.dshu-plugins-head .dshu-upgrade-all{margin-left:auto}',
-  '.dshu-upgrade-all,.dshu-restart{padding:4px 10px;font-size:12px;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.12));border-radius:var(--dsw-radius-sm,6px);background:transparent;color:inherit;font:inherit;cursor:pointer}',
+  '.dshu-upgrade-all,.dshu-restart{padding:4px 10px;font-size:12px;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.12));border-radius:var(--dsw-radius-sm,6px);background:transparent;color:inherit;font-family:inherit;cursor:pointer}',
   '.dshu-upgrade-all:disabled{opacity:.5;cursor:default}',
   '.dshu-plugin-summary{font-size:12px;color:var(--dsw-alias-label-tertiary,inherit)}',
   '.dshu-plugin-summary[hidden]{display:none}',
@@ -747,6 +747,9 @@ function renderSurvey(view: View): void {
     upgrade.textContent = survey.blocked.message !== '' ? survey.blocked.message : '需要 Node（本机版本不满足）'
     upgrade.title = survey.blocked.code
   } else {
+    // 状态可能比插件列表晚到：这期间批量已经在跑，按钮必须一开始就是禁用的，
+    // 否则会造出一个点下去毫无反应的入口。
+    upgrade.disabled = view.batchBusy || view.upgradeBusy
     upgrade.addEventListener('click', () => {
       void runHostUpgrade(view, view.token)
     })
@@ -1007,6 +1010,13 @@ export function paintBatchItem(row: PluginRowView, item: BatchItem): void {
   }
 }
 
+/** R44：batch 对跳过的包不发事件，收尾时按 summary 补一行状态。 */
+function paintSkipped(row: PluginRowView): void {
+  setRowState(row, '已跳过')
+  row.progressText.textContent = ''
+  setRowProgress(row, null, false)
+}
+
 /** R33：一行里把「升成几个、败几个、跳几个」说清；为 0 的那段不写。 */
 function batchSummaryText(summary: BatchSummary): string {
   const parts: string[] = []
@@ -1015,6 +1025,17 @@ function batchSummaryText(summary: BatchSummary): string {
   if (summary.skipped.length > 0) parts.push(String(summary.skipped.length) + ' 个跳过')
   if (summary.restartRequired && summary.succeeded.length > 0) parts.push('需重启生效')
   return parts.join('，')
+}
+
+/** 本体按钮该不该禁用：无更新、被阻塞，或任一侧正忙。 */
+function hostUpgradeDisabled(view: View): boolean {
+  return (
+    view.survey === null ||
+    view.survey.blocked !== null ||
+    !hasNewerTarget(view.survey) ||
+    view.batchBusy ||
+    view.upgradeBusy
+  )
 }
 
 /** 批量忙时按住所有会重画或并发起升级的入口；本体忙时反过来按住「全部升级」。 */
@@ -1028,8 +1049,7 @@ function setBatchBusy(view: View, busy: boolean): void {
     if (busy) {
       view.upgradeButton.disabled = true
     } else {
-      const blocked = view.survey !== null && view.survey.blocked !== null
-      view.upgradeButton.disabled = blocked || !hasNewerTarget(view.survey)
+      view.upgradeButton.disabled = hostUpgradeDisabled(view)
     }
   }
   emitState(view)
@@ -1064,15 +1084,24 @@ async function startBatch(view: View): Promise<void> {
         if (row !== undefined) paintBatchItem(row, event.item)
       },
     })
-  } catch {
+  } catch (error) {
+    // runBatch 的契约是不抛异常；真抛了也不能把红条甩到底栏——失败原因留在汇总行。
     if (!live(view, token)) return
     setBatchBusy(view, false)
-    showError(view, '批量升级请求失败，请检查网络后重试')
+    paintSummary(view, '升级中断：' + (error instanceof Error && error.message !== '' ? error.message : '未知原因'))
     return
   }
   if (!live(view, token)) return
   setBatchBusy(view, false)
-  const text = batchSummaryText(summary)
+  paintSummary(view, batchSummaryText(summary))
+  for (const name of summary.skipped) {
+    const row = view.rows.get(name)
+    if (row !== undefined) paintSkipped(row)
+  }
+}
+
+/** 汇总行：空文案就收起，不占一条空缝。 */
+function paintSummary(view: View, text: string): void {
   view.pluginSummary.textContent = text
   view.pluginSummary.hidden = text === ''
 }
@@ -1135,6 +1164,9 @@ async function loadHost(
 }
 
 async function loadPlugins(view: View, token: number): Promise<void> {
+  // 批次进行中重画列表会让 rows 与 names 快照脱节（点击时的名单已经发出去了），
+  // 这段窗口里不再接受列表刷新。
+  if (view.batchBusy) return
   const base = view.options.apiBase ?? ''
   try {
     const plugins = await fetchPluginUpdates(fetchOf(view.doc), base)

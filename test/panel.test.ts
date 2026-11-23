@@ -93,7 +93,7 @@ function controlledStream(): { response: FakeResponse, push: (text: string) => v
 }
 
 /** routes 的键是 "METHOD /path"。没命中的路由回 404；处理器第二个参数是原始 url。 */
-type RouteHandler = (init: FakeInit, url: string) => FakeResponse
+type RouteHandler = (init: FakeInit, url: string) => FakeResponse | Promise<FakeResponse>
 
 function serve(routes: Record<string, RouteHandler>): Call[] {
   const calls: Call[] = []
@@ -126,6 +126,8 @@ type BatchRoutesOptions = {
   steps?: Record<string, OperationStep[]>
   /** POST 直接以这个状态码失败（模拟请求层不可用）。 */
   postStatus?: number
+  /** 只让指定包的 POST 失败，其余照常起操作。 */
+  postFailures?: Record<string, { status: number, code?: string, message?: string }>
   onPost?: (name: string) => void
   onPoll?: (name: string, index: number) => void
 }
@@ -159,6 +161,13 @@ function batchRoutes(options: BatchRoutesOptions = {}): Record<string, RouteHand
       options.onPost?.(name)
       if (options.postStatus !== undefined) {
         return jsonResponse({ code: 'MARKET_UNAVAILABLE', message: '插件更新不可用' }, options.postStatus)
+      }
+      const failure = options.postFailures?.[name]
+      if (failure !== undefined) {
+        return jsonResponse(
+          { failure: { code: failure.code ?? 'INSTALL_FAILED', message: failure.message ?? '' } },
+          failure.status,
+        )
       }
       return jsonResponse({ operation: { operationId: 'op-' + name } }, 202)
     },
@@ -785,6 +794,81 @@ describe('全部升级', () => {
     // 同步断言：第一次 await 之前就得把上一轮画的东西清掉。
     expect(document.querySelector<HTMLElement>('[data-name="a"] .dshu-plugin-state')?.textContent).toBe('')
     expect(document.querySelector<HTMLElement>('[data-name="a"] .dshu-plugin-progress')?.hidden).toBe(true)
+    closePanel()
+  })
+
+  test('本体状态晚到：先点了全部升级，新出的本体按钮也是禁用的', async () => {
+    let releaseStatus!: (value: FakeResponse) => void
+    const gate = new Promise<FakeResponse>((resolve) => {
+      releaseStatus = resolve
+    })
+    const routes = batchRoutes({ packages: ['a'], steps: { a: [{ state: 'running', percent: 10 }] } })
+    routes['GET /dsh-upgrade/api/status'] = () => gate
+    serve(routes)
+
+    const opening = openPanel(document, { pollIntervalMs: 40 })
+    // 等插件列表渲染完：按钮创建时默认可见，hidden 不能当作「数据到了」的信号。
+    await waitFor(() => document.querySelector('.dshu-plugin[data-name="a"]') !== null)
+    const all = document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')
+    all?.click()
+    await waitFor(() => all?.disabled === true)
+    expect(upgradeButton()).toBeNull()
+
+    releaseStatus(jsonResponse(SURVEY_UPDATE))
+    await waitFor(() => upgradeButton() !== null)
+    expect(upgradeButton()?.disabled).toBe(true)
+    await opening
+    closePanel()
+  })
+
+  test('中途遇到宿主已有升级：本包失败，后面的记跳过，且不再发请求', async () => {
+    const calls = serve(batchRoutes({
+      packages: ['a', 'b', 'c'],
+      postFailures: { b: { status: 409, code: 'OPERATION_BUSY', message: '已有升级在跑' } },
+    }))
+    await openPanel(document, { pollIntervalMs: 10 })
+
+    document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')?.click()
+    await waitFor(() => (document.querySelector('.dshu-plugin-summary')?.textContent ?? '').includes('跳过'))
+
+    const summary = document.querySelector<HTMLElement>('.dshu-plugin-summary')
+    expect(summary?.textContent).toBe('1 个已升级，1 个失败，1 个跳过')
+    expect(callsTo(calls, 'POST', '/dsh-market/api/v1/updates')).toHaveLength(2)
+    expect(document.querySelector('[data-name="c"] .dshu-plugin-state')?.textContent).toBe('已跳过')
+    closePanel()
+  })
+
+  test('有包要求重启时，汇总里说清需重启生效', async () => {
+    serve(batchRoutes({
+      packages: ['a'],
+      steps: { a: [{ state: 'succeeded', restartRequired: true }] },
+    }))
+    await openPanel(document, { pollIntervalMs: 10 })
+
+    document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')?.click()
+    await waitFor(() => (document.querySelector('.dshu-plugin-summary')?.textContent ?? '').includes('需重启生效'))
+
+    expect(document.querySelector('.dshu-plugin-summary')?.textContent).toBe('1 个已升级，需重启生效')
+    closePanel()
+  })
+
+  test('没有可更新的插件时不显示「全部升级」', async () => {
+    serve(batchRoutes({ packages: [] }))
+    await openPanel(document)
+
+    expect(document.querySelector('.dshu-plugin-empty')?.textContent).toBe('已是最新')
+    expect(document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')?.hidden).toBe(true)
+    closePanel()
+  })
+
+  test('本体升级进行中，「全部升级」是禁用的', async () => {
+    serve(batchRoutes({ packages: ['a'] }))
+    await openPanel(document)
+    await waitFor(() => upgradeButton() !== null)
+
+    upgradeButton()?.click()
+    // runHostUpgrade 在第一个 await 之前就把忙态置上了。
+    expect(document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')?.disabled).toBe(true)
     closePanel()
   })
 })
