@@ -911,14 +911,12 @@ function paintBatchItem(row: PluginRowView, item: BatchItem): void {
       return
     case 'running': {
       const percent = item.percent
-      // 状态行放批量层给的短句（排队时是「等 N 个运行中的会话结束」），进度文字放 pnpm 的原话。
-      setRowState(row, item.message ?? '正在升级…')
+      // 行内文案按批量层给的优先级：排队提示（message）> pnpm 原话（detail）> 百分比。
+      setRowState(row, '')
       row.progressText.textContent =
-        item.detail !== null
-          ? item.detail
-          : percent !== null
-            ? '正在升级…' + String(percent) + '%'
-            : '正在升级…'
+        item.message ??
+        item.detail ??
+        (percent !== null ? '正在升级…' + String(percent) + '%' : '正在升级…')
       setRowProgress(row, percent, true)
       return
     }
@@ -935,12 +933,19 @@ function paintBatchItem(row: PluginRowView, item: BatchItem): void {
         return
       }
       const message = item.message
-      setRowState(
-        row,
-        message !== null && message !== '' ? '升级失败：' + compactReason(message) : '升级失败',
-        true,
-        message ?? undefined,
-      )
+      // 批量层的 message 可能是纯原因（补「升级失败：」），也可能已经是完整句子（直接显示）。
+      const complete =
+        message !== null &&
+        (message.startsWith('升级失败') ||
+          message.startsWith('已') ||
+          message === '插件更新不可用')
+      const text =
+        message === null || message === ''
+          ? '升级失败'
+          : complete
+            ? message
+            : '升级失败：' + compactReason(message)
+      setRowState(row, text, true, message ?? undefined)
       return
     }
   }
