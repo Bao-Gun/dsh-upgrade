@@ -6,13 +6,15 @@
  * 全局状态，只把每个包的进展通过 onEvent 发出去，最后给一份汇总。
  *
  * 失败留在失败包自己身上：一个包装挂了、卡住了、回滚了，都接着升下一个；
- * 只有调用方明确叫停（关面板）才把剩下的包标成 skipped。
+ * 只有调用方叫停（关面板）或宿主已有升级在跑（OPERATION_BUSY），才把剩下的
+ * 包标成 skipped。
  */
 
 import {
   isPluginUnavailableCode,
   pollPluginOperation,
   startPluginUpdate,
+  UNAVAILABLE_MESSAGE,
   type PluginOperation,
 } from './market'
 
@@ -53,7 +55,8 @@ export const DEFAULT_POLL_INTERVAL_MS = 800
 export const MAX_POLLS = 1500
 export const DEFAULT_STALLED_WAIT_MS = 180_000
 
-const UNAVAILABLE_MESSAGE = '插件更新不可用'
+/** 宿主已经有一个升级在跑：再起只会被同样拒绝，整批直接收尾。 */
+const HOST_BUSY_CODE = 'OPERATION_BUSY'
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -61,6 +64,13 @@ function sleep(ms: number): Promise<void> {
 
 function itemOf(name: string, state: BatchItemState): BatchItem {
   return { name, state, percent: null, detail: null, message: null, unavailable: false }
+}
+
+/** 稀疏数组的空洞没有名字，用空串占位，保证三段计数加起来等于 names.length。 */
+function restNames(names: string[], from: number): string[] {
+  const rest: string[] = []
+  for (let index = from; index < names.length; index += 1) rest.push(names[index] ?? '')
+  return rest
 }
 
 /** 判定「还在动」的指纹：状态、百分比、pnpm 输出任一变化都算推进。 */
@@ -116,7 +126,8 @@ function settleItem(name: string, operation: PluginOperation): BatchItem {
   return item
 }
 
-type BatchOutcome = { ok: boolean; restartRequired: boolean }
+/** hostBusy：宿主上已经有升级在跑，后面的包不可能成功，整批就此收尾。 */
+type BatchOutcome = { ok: boolean; restartRequired: boolean; hostBusy: boolean }
 
 /** 升级一个包：起操作、轮询到终态。不抛异常——失败都变成 settled 事件。 */
 async function upgradeOne(
@@ -138,7 +149,11 @@ async function upgradeOne(
         started.message !== undefined && started.message !== '' ? started.message : '升级失败'
     }
     emit({ kind: 'settled', item })
-    return { ok: false, restartRequired: false }
+    return {
+      ok: false,
+      restartRequired: false,
+      hostBusy: started.code === HOST_BUSY_CODE,
+    }
   }
 
   let lastMove = ''
@@ -155,7 +170,7 @@ async function upgradeOne(
         const item = itemOf(name, 'failed')
         item.message = stalledReason(operation)
         emit({ kind: 'settled', item })
-        return { ok: false, restartRequired: false }
+        return { ok: false, restartRequired: false, hostBusy: false }
       }
       const item = itemOf(name, 'running')
       item.percent = operation.progress?.percent ?? null
@@ -170,6 +185,7 @@ async function upgradeOne(
     return {
       ok: item.state === 'succeeded',
       restartRequired: item.state === 'succeeded' && operation.restartRequired,
+      hostBusy: false,
     }
   }
 
@@ -177,14 +193,15 @@ async function upgradeOne(
   const timeout = itemOf(name, 'failed')
   timeout.message = '升级超时，稍后重试'
   emit({ kind: 'settled', item: timeout })
-  return { ok: false, restartRequired: false }
+  return { ok: false, restartRequired: false, hostBusy: false }
 }
 
 /**
  * 按 names 顺序串行升级，返回汇总。
  *
  * 起每个包之前先问 cancelled()：已经叫停就把当前包和剩下的全部标成
- * skipped 并立即返回，不再发请求。除此之外不提前结束——一个包失败不影响后面。
+ * skipped 并立即返回，不再发请求。宿主回 OPERATION_BUSY 时同样收尾：那一个
+ * 包记 failed，其余进 skipped。除此之外不提前结束——一个包失败不影响后面。
  */
 export async function runBatch(
   names: string[],
@@ -195,13 +212,23 @@ export async function runBatch(
   const interval = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS
   const stalledWaitMs = options.stalledWaitMs ?? DEFAULT_STALLED_WAIT_MS
   const summary: BatchSummary = { succeeded: [], failed: [], skipped: [], restartRequired: false }
-  const emit = (event: BatchEvent): void => options.onEvent?.(event)
+  const emit = (event: BatchEvent): void => {
+    try {
+      options.onEvent?.(event)
+    } catch {
+      // 面板绘制出错不能吞掉整批：事件只是通知，队列照常往下升。
+    }
+  }
 
   for (let index = 0; index < names.length; index += 1) {
     const name = names[index]
-    if (name === undefined) continue
+    if (name === undefined) {
+      // 空洞没有名字，不能静默漏项：用空串占一个 skipped 名额。
+      summary.skipped.push('')
+      continue
+    }
     if (options.cancelled?.() === true) {
-      summary.skipped.push(...names.slice(index))
+      summary.skipped.push(...restNames(names, index))
       return summary
     }
     const outcome = await upgradeOne(name, f, base, interval, stalledWaitMs, emit)
@@ -210,6 +237,11 @@ export async function runBatch(
       if (outcome.restartRequired) summary.restartRequired = true
     } else {
       summary.failed.push(name)
+      if (outcome.hostBusy) {
+        // 宿主上已有升级在跑，后面的包必然同样被拒，别再连报 N 次。
+        summary.skipped.push(...restNames(names, index + 1))
+        return summary
+      }
     }
   }
   return summary
