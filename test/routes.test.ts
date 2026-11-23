@@ -15,6 +15,7 @@ import {
   type RouteRequest,
   type RouteResponse,
 } from '../src/server/routes'
+import { writeLast } from '../src/server/state'
 
 const CURRENT = '0.2.2-rc.5'
 const TARGET = '0.2.3-alpha.2'
@@ -222,6 +223,8 @@ describe('GET /status', () => {
     // 稳定通道没有比当前 rc 更新的版本 → 目标留在当前版本
     expect(body.target).toBe(CURRENT)
     expect(body.includePrerelease).toBe(false)
+    // 没升级过、没标记：正常状态就是不需要重启
+    expect(body.restartRequired).toBe(false)
     // 比当前新的只有 alpha，而它的 engines 不满足本机 node → 报被拦原因
     expect(body.blocked).toEqual({
       code: 'RUNTIME_UNSUPPORTED',
@@ -243,6 +246,30 @@ describe('GET /status', () => {
 
     const channels = jsonOf(state).channels as Record<string, unknown>
     expect(channels).toEqual({ latest: '0.2.1', next: null, alpha: null })
+  })
+
+  test('盘上已装好当前版本、只差重启时，status 报 restartRequired true', async () => {
+    // 场景：升级成功 → 页面刷新，磁盘 package.json 已是 CURRENT，进程还是旧的。
+    await writeLast({ lastResult: { to: CURRENT, at: NOW, restartRequired: true } })
+    const route = setup(baseDeps())(STATUS_PATH)
+    const { res, state } = fakeRes()
+
+    await route.handler(request('GET', STATUS_PATH), res)
+
+    expect(state.status).toBe(200)
+    const body = jsonOf(state)
+    expect(body.target).toBe(CURRENT)
+    expect(body.restartRequired).toBe(true)
+  })
+
+  test('标记指向别的版本时不算「需重启」', async () => {
+    await writeLast({ lastResult: { to: TARGET, at: NOW, restartRequired: true } })
+    const route = setup(baseDeps())(STATUS_PATH)
+    const { res, state } = fakeRes()
+
+    await route.handler(request('GET', STATUS_PATH), res)
+
+    expect(jsonOf(state).restartRequired).toBe(false)
   })
 })
 
@@ -305,6 +332,7 @@ describe('POST /upgrade', () => {
     >
     expect(last.running).toBe(false)
     expect((last.lastResult as Record<string, unknown>).to).toBe(TARGET)
+    expect((last.lastResult as Record<string, unknown>).restartRequired).toBe(true)
     // R10：成功路径显式传 lastError: undefined，旧错误必须被删掉
     expect('lastError' in last).toBe(false)
   })

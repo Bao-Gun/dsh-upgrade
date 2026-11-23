@@ -6,10 +6,6 @@
  */
 let running = false
 
-export function isUpgradeRunning(): boolean {
-  return running
-}
-
 export function tryAcquireUpgrade(): boolean {
   if (running) return false
   running = true

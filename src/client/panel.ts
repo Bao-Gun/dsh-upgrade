@@ -52,6 +52,13 @@ const RESTART_PATH = '/dsh-restart/api/restart'
 const HOST_HEADERS: Record<string, string> = { 'x-dsh-upgrade': '1' }
 const RESTART_HEADERS: Record<string, string> = { 'x-dsh-restart': '1' }
 
+/** dsh-restart 预检的阶段名 → 人话；未知阶段原样显示，不吞信息。 */
+const RESTART_STAGE_LABELS: Record<string, string> = {
+  config: '配置检查',
+  compat: '插件兼容检查',
+  boot: '启动冒烟检查',
+}
+
 const RELEASE_PAGE = 'https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v'
 const DEFAULT_POLL_INTERVAL_MS = 800
 /** 一轮升级最多盯这么久（约 20 分钟），防止流断在半路时无限轮询。 */
@@ -120,6 +127,8 @@ type Survey = {
   target: string
   blocked: { code: string, message: string } | null
   includePrerelease: boolean
+  /** 盘上已是 current、但进程还在跑旧代码：升级完成过，只差一次重启 */
+  restartRequired: boolean
 }
 
 type Release = {
@@ -226,8 +235,13 @@ function live(view: View, token: number): boolean {
   return !view.closed && view.token === token
 }
 
-function hasHostUpdate(survey: Survey | null): boolean {
+function hasNewerTarget(survey: Survey | null): boolean {
   return survey !== null && survey.target !== '' && survey.target !== survey.current
+}
+
+/** 有更新，或升级装完还没重启——两种状态都要让入口角标亮着。 */
+function hasHostUpdate(survey: Survey | null): boolean {
+  return hasNewerTarget(survey) || (survey !== null && survey.restartRequired)
 }
 
 function normalizeSurvey(value: unknown): Survey | null {
@@ -249,6 +263,7 @@ function normalizeSurvey(value: unknown): Survey | null {
         ? null
         : { code: asString(blockedRaw.code), message: asString(blockedRaw.message) },
     includePrerelease: value.includePrerelease === true,
+    restartRequired: value.restartRequired === true,
   }
 }
 
@@ -494,11 +509,14 @@ function buildView(doc: Document, options: PanelOptions): View {
     if (event.target === overlay) close(view)
   })
   prerelease.addEventListener('change', () => {
+    // 升级进行中重查会用旧 survey 重画，按钮忽隐忽现且点击无效果；直接按住。
+    if (view.upgradeBusy) return
     const token = view.token
     view.includePrerelease = prerelease.checked
     void loadHost(view, token, { check: true, force: false })
   })
   refreshButton.addEventListener('click', () => {
+    if (view.upgradeBusy) return
     const token = view.token
     view.includePrerelease = prerelease.checked
     void loadHost(view, token, { check: true, force: true })
@@ -608,10 +626,24 @@ function renderSurvey(view: View): void {
     return
   }
 
-  if (!hasHostUpdate(survey)) {
+  if (survey.restartRequired) {
+    // target === current 时不能报「已是最新」：盘上是新的，跑着的进程还是旧的。
     view.hostVersions.appendChild(
-      element(doc, 'span', 'dshu-current', '已是最新（当前 ' + survey.current + '）'),
+      element(
+        doc,
+        'span',
+        'dshu-current dshu-restart-required',
+        '已升级到 ' + survey.current + '，需重启 dsh web 才生效',
+      ),
     )
+  }
+
+  if (!hasNewerTarget(survey)) {
+    if (!survey.restartRequired) {
+      view.hostVersions.appendChild(
+        element(doc, 'span', 'dshu-current', '已是最新（当前 ' + survey.current + '）'),
+      )
+    }
     return
   }
 
@@ -655,7 +687,7 @@ function renderReleases(view: View, reply: ReleasesReply): void {
   const box = view.releaseBox
   box.textContent = ''
   const survey = view.survey
-  if (survey === null || !hasHostUpdate(survey)) {
+  if (survey === null || !hasNewerTarget(survey)) {
     box.hidden = true
     return
   }
@@ -795,7 +827,7 @@ async function loadHost(
     renderSurvey(view)
     emitState(view)
     if (!live(view, token)) return
-    if (!hasHostUpdate(survey)) return
+    if (!hasNewerTarget(survey)) return
     const releases = await requestJson(
       f,
       joinUrl(base, RELEASES_PATH) +
@@ -831,13 +863,15 @@ async function loadPlugins(view: View, token: number): Promise<void> {
 
 async function runHostUpgrade(view: View, token: number): Promise<void> {
   const survey = view.survey
-  if (survey === null || !hasHostUpdate(survey) || view.upgradeBusy) return
+  if (survey === null || !hasNewerTarget(survey) || view.upgradeBusy) return
   const target = survey.target
   const f = fetchOf(view.doc)
   const base = view.options.apiBase ?? ''
 
   view.upgradeBusy = true
   if (view.upgradeButton !== null) view.upgradeButton.disabled = true
+  view.prerelease.disabled = true
+  view.refreshButton.disabled = true
   clearError(view)
   setNotice(view, '')
   resetProgress(view)
@@ -877,9 +911,11 @@ async function runHostUpgrade(view: View, token: number): Promise<void> {
 
 function finishHostBusy(view: View): void {
   view.upgradeBusy = false
+  view.prerelease.disabled = false
+  view.refreshButton.disabled = false
   if (view.upgradeButton !== null) {
     const blocked = view.survey !== null && view.survey.blocked !== null
-    view.upgradeButton.disabled = blocked || !hasHostUpdate(view.survey)
+    view.upgradeButton.disabled = blocked || !hasNewerTarget(view.survey)
   }
   emitState(view)
 }
@@ -943,7 +979,14 @@ async function continueToRestart(view: View, token: number, target: string): Pro
   }
   if (!live(view, token)) return
   if (!status.ok) {
-    manualRestart('没找到 dsh-restart')
+    // 只有 404 才意味着插件不在；403/500 是「在，但拒绝/坏了」，不能误导人去装。
+    manualRestart(
+      status.status === 404
+        ? '没找到 dsh-restart'
+        : status.status === 401 || status.status === 403
+          ? 'dsh-restart 拒绝访问（HTTP ' + status.status + '）'
+          : 'dsh-restart 状态查询失败（HTTP ' + status.status + '）',
+    )
     return
   }
 
@@ -967,8 +1010,21 @@ async function continueToRestart(view: View, token: number, target: string): Pro
   let passed = true
   try {
     await readNdjson(precheck, (event) => {
+      if (!live(view, token)) return
       if (event.ok === false) passed = false
       if (event.error !== undefined && event.error !== null) passed = false
+      const stage = asString(event.stage)
+      if (stage !== '') {
+        // 预检会克隆 profile 再起一个冒烟实例，几十秒没反馈像是卡死；把阶段推进度条。
+        addProgress(
+          view,
+          '重启预检：' +
+            (RESTART_STAGE_LABELS[stage] ?? stage) +
+            (event.ok === false ? '（未通过）' : '（通过）'),
+        )
+        return
+      }
+      if (event.done === true) addProgress(view, '重启预检完成')
     })
   } catch {
     if (live(view, token)) manualRestart('预检读到一半断了')
@@ -993,7 +1049,7 @@ async function continueToRestart(view: View, token: number, target: string): Pro
   }
   if (!live(view, token)) return
   if (restart.status === 409) {
-    setNotice(view, '已经有一轮重启在进行，等页面自己刷新')
+    setNotice(view, '已经有一轮重启在进行，请稍后手动刷新页面确认')
     return
   }
   if (!restart.ok) {

@@ -5,7 +5,7 @@
  * 请求门与 dsh-restart 同风格——方法只收 GET/POST、必须带 x-dsh-upgrade: 1，
  * 带 Origin 时必须与 Host 一致；不合格一律 403，且不回显任何内部路径。
  *
- * 升级是长活：用 NDJSON 逐事件推进度，模块级 running 保证同一时刻只跑一轮。
+ * 升级是长活：用 NDJSON 逐事件推进度，lock.ts 的单飞锁保证同一时刻只跑一轮。
  * 升级状态机的副作用都在 upgrade.ts，这里只做请求映射与状态落盘。
  */
 import {
@@ -17,7 +17,7 @@ import {
 import { releaseUpgrade, tryAcquireUpgrade } from './lock'
 import { markPending } from './notify'
 import { fetchReleases, type ReleaseEntry } from './releases'
-import { rootDir, writeLast } from './state'
+import { readRestartRequired, rootDir, writeLast } from './state'
 import { surveyOf, type Blocked } from './survey'
 import { runUpgrade, type UpgradeEvent } from './upgrade'
 
@@ -159,6 +159,9 @@ function statusHandler(deps: ResolvedDeps): RouteHandler {
         deps.fetchRegistry({ force: false }),
       ])
       const survey = await surveyOf(host.version, registry.info, false, deps)
+      // 磁盘上的 package.json 已是新版本、进程还是旧的（装完没重启）时，
+      // target === current 会被误报成「已是最新」，这个标记才是真相。
+      const restartRequired = await readRestartRequired(host.version)
       respondJson(res, 200, {
         current: survey.current,
         channels: survey.channels,
@@ -166,6 +169,7 @@ function statusHandler(deps: ResolvedDeps): RouteHandler {
         // R3：状态接口键集稳定，没有拦因也显式给 null，前端不用判 key 是否存在。
         blocked: survey.blocked ?? null,
         includePrerelease: survey.includePrerelease,
+        restartRequired,
       })
     } catch (error) {
       respondJson(res, 500, errorBodyOf(error))
@@ -225,6 +229,8 @@ function upgradeHandler(deps: ResolvedDeps): RouteHandler {
       return
     }
 
+    // running 标记只写「真开始跑了」的请求；400 早退不该在盘上留下痕迹。
+    let markedRunning = false
     try {
       const body = bodyOf(req)
       if (body === null) {
@@ -268,6 +274,10 @@ function upgradeHandler(deps: ResolvedDeps): RouteHandler {
         }
       }
 
+      // running 与进程内锁各管一边：锁防并发，这个字段让盘上能看出「上一轮没走完」。
+      await writeLast({ running: true }).catch(() => {})
+      markedRunning = true
+
       // R22：先落 marker 再动手。进程若死在安装中，重启后还能补通知。
       await markPending(host.version, target)
 
@@ -288,6 +298,8 @@ function upgradeHandler(deps: ResolvedDeps): RouteHandler {
       safeEnd(res)
     } finally {
       releaseUpgrade()
+      // 无论成功、失败还是抛错，这一轮都结束了；写失败只影响诊断，不影响请求。
+      if (markedRunning) await writeLast({ running: false }).catch(() => {})
     }
   }
 }
@@ -300,7 +312,6 @@ async function settleLast(
   if (result.ok) {
     // R10：显式传 undefined，删掉上一次失败留下的 lastError
     await writeLast({
-      running: false,
       lastResult: { to: target, at: now, restartRequired: true },
       lastError: undefined,
     })
@@ -308,7 +319,6 @@ async function settleLast(
   }
   const error = result.error ?? { code: 'UPGRADE_FAILED', message: '升级失败' }
   await writeLast({
-    running: false,
     lastError: { code: error.code, message: error.message, at: now },
   })
 }

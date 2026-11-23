@@ -4,7 +4,7 @@
  * 会碰真实安装目录 / 网络 / 子进程的依赖全部注入，测试不联网、不装任何东西；
  * DSH_UPGRADE_ROOT 指到临时目录，不读写真实的升级状态文件。
  */
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
@@ -12,6 +12,7 @@ import { apply, inject as pluginInject, name as pluginName } from '../src/index'
 import type { RegistryInfo } from '../src/server/host'
 import { releaseUpgrade, tryAcquireUpgrade } from '../src/server/lock'
 import { CHECK_PATH, RELEASES_PATH, STATUS_PATH, UPGRADE_PATH } from '../src/server/routes'
+import { readLast, readRestartRequired } from '../src/server/state'
 import { dshUpgrade, dshUpgradeCheck, registerTools, type ToolDeps } from '../src/server/tools'
 import type { UpgradeEvent } from '../src/server/upgrade'
 
@@ -144,6 +145,8 @@ describe('dshUpgrade', () => {
     expect(value.error?.code).toBe('RUNTIME_UNSUPPORTED')
     expect(vi.mocked(deps.readTargetManifest!)).toHaveBeenCalledWith(ALPHA)
     expect(vi.mocked(deps.runUpgrade!)).not.toHaveBeenCalled()
+    // 被拦的版本不能留下任何「已升级」的盘上痕迹。
+    expect(await readLast()).toBeNull()
   })
 
   test('装得上的版本：调安装并提醒重启', async () => {
@@ -156,6 +159,15 @@ describe('dshUpgrade', () => {
     const input = run.mock.calls[0]?.[0]
     expect(input).toMatchObject({ target: OLD, installDir: HOST_DIR })
     expect(input?.root).toBe(upgradeRoot)
+
+    // agent 升级也要给页面留「装完没重启」的凭据，刷新后仍能提示需重启。
+    expect(await readRestartRequired(OLD)).toBe(true)
+    const last = JSON.parse(await readFile(join(upgradeRoot, 'last.json'), 'utf8')) as Record<
+      string,
+      unknown
+    >
+    expect(last.lastResult).toMatchObject({ to: OLD, restartRequired: true })
+    expect('lastError' in last).toBe(false)
   })
 
   test('registry 里没有的版本直接拒绝', async () => {

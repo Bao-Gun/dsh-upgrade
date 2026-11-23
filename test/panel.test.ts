@@ -7,7 +7,7 @@
  * 退回 text() 的路径——后者是测试环境最容易漏掉的一条。
  */
 import { afterEach, describe, expect, test, vi } from 'vitest'
-import { closePanel, openPanel } from '../src/client/panel'
+import { closePanel, openPanel, probeHasUpdate } from '../src/client/panel'
 import { apply } from '../src/client/index'
 
 type Call = { url: string, method: string, headers: Record<string, string>, body: unknown }
@@ -249,6 +249,37 @@ describe('面板骨架与本体段', () => {
     closePanel()
   })
 
+  test('升级装完没重启：显示「需重启」而不是「已是最新」，角标仍亮、无升级按钮', async () => {
+    serve({
+      ...fullRoutes(),
+      'GET /dsh-upgrade/api/status': () =>
+        jsonResponse({ ...SURVEY_UPDATE, target: SURVEY_UPDATE.current, restartRequired: true }),
+    })
+    const states: Array<{ hasUpdate: boolean }> = []
+
+    await openPanel(document, { onState: (state) => states.push({ hasUpdate: state.hasUpdate }) })
+
+    const text = hostSection()?.textContent ?? ''
+    expect(text).toContain('需重启')
+    expect(text).toContain('0.2.2-rc.5')
+    expect(text).not.toContain('已是最新')
+    expect(upgradeButton()).toBeNull()
+    // 角标靠 onState 的 hasUpdate 亮灭：这里必须仍是「有更新」。
+    expect(states.at(-1)?.hasUpdate).toBe(true)
+
+    closePanel()
+  })
+
+  test('probeHasUpdate 把「装完没重启」也算作有更新', async () => {
+    serve({
+      ...fullRoutes(),
+      'GET /dsh-upgrade/api/status': () =>
+        jsonResponse({ ...SURVEY_UPDATE, target: SURVEY_UPDATE.current, restartRequired: true }),
+    })
+
+    await expect(probeHasUpdate(document)).resolves.toBe(true)
+  })
+
   test('target 为 null 也按无更新处理', async () => {
     serve({
       ...fullRoutes(),
@@ -464,6 +495,12 @@ describe('本体升级的 NDJSON 进度', () => {
     await waitFor(() => noticeText().includes('正在重启'))
     expect(noticeText()).toContain('0.2.3-alpha.2')
     expect(errorBar()).toBeNull()
+    // 预检的三个阶段都要落进进度条，别让几十秒的冒烟检查看起来像卡死。
+    const progress = textOf('.dshu-progress')
+    expect(progress).toContain('配置检查')
+    expect(progress).toContain('插件兼容检查')
+    expect(progress).toContain('启动冒烟检查')
+    expect(progress).toContain('重启预检完成')
 
     const precheck = callsTo(calls, 'POST', '/dsh-restart/api/precheck')
     expect(precheck).toHaveLength(1)
@@ -474,6 +511,81 @@ describe('本体升级的 NDJSON 进度', () => {
     const statusCalls = callsTo(calls, 'GET', '/dsh-restart/api/status')
     expect(statusCalls).toHaveLength(1)
     expect(statusCalls[0]?.headers['x-dsh-restart']).toBe('1')
+
+    closePanel()
+  })
+
+  test('dsh-restart 在但 status 500：指出状态查询失败，不误报「没找到」', async () => {
+    serve({
+      ...fullRoutes(),
+      'POST /dsh-upgrade/api/upgrade': () => textResponse('{"phase":"done","done":true}\n'),
+      'GET /dsh-restart/api/status': () => jsonResponse({ code: 'BOOM', message: '内部错误' }, 500),
+    })
+
+    await openPanel(document)
+    upgradeButton()?.click()
+
+    await waitFor(() => noticeText().includes('需手动重启'))
+    expect(noticeText()).toContain('HTTP 500')
+    expect(noticeText()).not.toContain('没找到')
+
+    closePanel()
+  })
+
+  test('restart 409：提示手动刷新，不再承诺「页面会自己刷新」', async () => {
+    serve({
+      ...fullRoutes(),
+      'POST /dsh-upgrade/api/upgrade': () => textResponse('{"phase":"done","done":true}\n'),
+      'GET /dsh-restart/api/status': () => jsonResponse({ ok: true, health: true }),
+      'POST /dsh-restart/api/precheck': () =>
+        textResponse('{"stage":"boot","ok":true,"failures":[]}\n{"done":true}\n'),
+      'POST /dsh-restart/api/restart': () => jsonResponse({ code: 'BUSY', message: '已有重启' }, 409),
+    })
+
+    await openPanel(document)
+    upgradeButton()?.click()
+
+    await waitFor(() => noticeText().includes('重启在进行'))
+    expect(noticeText()).toContain('手动刷新')
+    expect(noticeText()).not.toContain('自己刷新')
+
+    closePanel()
+  })
+
+  test('升级进行中：预发布开关与重新检查都禁用，结束后恢复', async () => {
+    let push: (chunk: string) => void = () => {}
+    let finish: () => void = () => {}
+    const encoder = new TextEncoder()
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        push = (chunk) => controller.enqueue(encoder.encode(chunk))
+        finish = () => controller.close()
+      },
+    })
+    serve({
+      ...fullRoutes(),
+      'POST /dsh-upgrade/api/upgrade': () => ({
+        ok: true,
+        status: 200,
+        body: stream,
+        json: async () => null,
+        text: async () => '',
+      }),
+    })
+
+    await openPanel(document)
+    const toggle = document.querySelector<HTMLInputElement>('.dshu-prerelease')
+    const refresh = document.querySelector<HTMLButtonElement>('.dshu-refresh')
+
+    upgradeButton()?.click()
+    expect(toggle?.disabled).toBe(true)
+    expect(refresh?.disabled).toBe(true)
+
+    push('{"phase":"done","done":true}\n')
+    finish()
+    await waitFor(() => toggle?.disabled === false)
+    expect(refresh?.disabled).toBe(false)
+    expect(noticeText()).toContain('需手动重启')
 
     closePanel()
   })

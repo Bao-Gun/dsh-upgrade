@@ -61,15 +61,6 @@ function decide(pending: Pending, current: string, now: number): Outcome {
   return 'clear'
 }
 
-export async function resolvePending(
-  current: string,
-  now: number = Date.now(),
-): Promise<'notify' | 'wait' | 'clear' | 'none'> {
-  const pending = await readPending()
-  if (pending === null) return 'none'
-  return decide(pending, current, now)
-}
-
 export async function notifyUpgraded(
   to: string,
   deps?: Partial<NotifyDeps>,

@@ -159,3 +159,28 @@ export async function writeLast(patch: Partial<Last>): Promise<void> {
   const next: Record<string, unknown> = { ...previous, ...patch }
   await writeJsonAtomic(file, next)
 }
+
+/**
+ * 磁盘上已经是 current，却还挂着「需重启」：说明上次升级装完但进程没换过来。
+ * 只认 to === current 的标记，避免把旧版本升级留下的标记错算到新版本头上。
+ */
+export async function readRestartRequired(current: string): Promise<boolean> {
+  const last = await readLast()
+  const result = last?.lastResult
+  return result !== undefined && result.restartRequired === true && result.to === current
+}
+
+/**
+ * 进程启动即证明盘上的版本已经在跑，那个「需重启」标记已经被兑现。
+ * 读写失败都只当没清掉，绝不抛——插件启动不能被一个状态文件拖垮。
+ */
+export async function clearRestartRequired(current: string): Promise<void> {
+  try {
+    const last = await readLast()
+    const result = last?.lastResult
+    if (result === undefined || result.restartRequired !== true || result.to !== current) return
+    await writeLast({ lastResult: { ...result, restartRequired: false } })
+  } catch {
+    // 最坏只是下次打开面板还提示一次「需重启」，不影响启动。
+  }
+}

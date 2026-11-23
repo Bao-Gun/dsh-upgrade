@@ -5,10 +5,12 @@ import { join } from 'node:path'
 import {
   backupDir,
   clearPending,
+  clearRestartRequired,
   ensureDir,
   readCache,
   readLast,
   readPending,
+  readRestartRequired,
   rootDir,
   writeCache,
   writeLast,
@@ -200,6 +202,41 @@ describe('上次结果', () => {
       running: false,
       lastResult: { to: '0.2.2', at: 111, restartRequired: true },
     })
+  })
+})
+
+describe('重启标记', () => {
+  test('只认 to === 当前版本且 restartRequired 为 true', async () => {
+    expect(await readRestartRequired('0.2.2')).toBe(false)
+
+    await writeLast({ lastResult: { to: '0.2.2', at: 111, restartRequired: true } })
+    expect(await readRestartRequired('0.2.2')).toBe(true)
+    expect(await readRestartRequired('0.2.1')).toBe(false)
+
+    await writeLast({ lastResult: { to: '0.2.2', at: 111, restartRequired: false } })
+    expect(await readRestartRequired('0.2.2')).toBe(false)
+  })
+
+  test('clearRestartRequired 只清匹配的版本，保留结果其它字段', async () => {
+    await writeLast({ lastResult: { to: '0.2.2', at: 111, restartRequired: true } })
+
+    await clearRestartRequired('0.2.1')
+    expect(await readLast()).toEqual({
+      running: false,
+      lastResult: { to: '0.2.2', at: 111, restartRequired: true },
+    })
+
+    await clearRestartRequired('0.2.2')
+    expect(await readLast()).toEqual({
+      running: false,
+      lastResult: { to: '0.2.2', at: 111, restartRequired: false },
+    })
+  })
+
+  test('坏 last.json 时读与清都不抛', async () => {
+    await writeFile(join(dir, 'last.json'), '{', 'utf8')
+    expect(await readRestartRequired('0.2.2')).toBe(false)
+    await expect(clearRestartRequired('0.2.2')).resolves.toBeUndefined()
   })
 })
 

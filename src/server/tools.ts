@@ -5,10 +5,11 @@
  * 真正的副作用（备份、安装、回滚）都在 upgrade.ts，这里只做
  * 「请求 → 状态机 → agent 能读的中文结果」这一层映射。
  * 工具不写 pending 标记，也不重启任何东西：重启是 dsh_restart 的事。
+ * 升级成功会写 last.json 的 restartRequired，让面板在页面刷新后仍能提示「需重启」。
  */
 import { fetchRegistry, readHostInfo, readTargetManifest, type HostInfo } from './host'
 import { releaseUpgrade, tryAcquireUpgrade } from './lock'
-import { rootDir } from './state'
+import { rootDir, writeLast } from './state'
 import { enginesBlockedOf, surveyOf, type Blocked, type Survey } from './survey'
 import { runUpgrade, type UpgradeEvent } from './upgrade'
 
@@ -33,7 +34,6 @@ export type UpgradeCheckValue = {
 export type UpgradeValue = {
   ok: boolean
   to?: string
-  backup?: string
   restartRequired?: boolean
   error?: { code: string; message: string }
 }
@@ -120,7 +120,6 @@ const UPGRADE_OUTPUT_SCHEMA: Record<string, unknown> = {
   properties: {
     ok: { type: 'boolean', description: '升级是否成功' },
     to: { type: 'string', description: '升级后的版本' },
-    backup: { type: 'string', description: '升级前备份所在目录' },
     restartRequired: { type: 'boolean', description: '是否需要重启 dsh web 才生效' },
     error: {
       type: 'object',
@@ -224,6 +223,11 @@ async function performUpgrade(target: string, deps: ResolvedToolDeps): Promise<U
   if (!result.ok) {
     return { ok: false, error: result.error ?? { code: 'UPGRADE_FAILED', message: '升级失败' } }
   }
+  // 装完还没重启：这个标记是页面刷新后唯一还知道该提示「需重启」的凭据。
+  await writeLast({
+    lastResult: { to: target, at: Date.now(), restartRequired: true },
+    lastError: undefined,
+  }).catch(() => {})
   return { ok: true, to: target, restartRequired: true }
 }
 
