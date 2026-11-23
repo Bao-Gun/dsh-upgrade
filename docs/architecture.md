@@ -59,6 +59,8 @@
 - `runBatch` 自身不抛：网络异常由 `pollPluginOperation` 收敛成结果对象，`onEvent` 抛错由 `emit` 内部吞掉 —— 单行绘制失败不能打断整批。
 - 批后不刷新插件列表（R47 已知边界）：names 是点击瞬间的快照，再点一次会把已升级的包重新 POST；本轮接受，先关面板重开再看。
 - 关闭面板只叫停队列（`cancelled: () => view.closed` 只在每包起包前查一次）：在飞的包仍轮询到终态，结果因 `live()` 为假被丢弃；立刻重开可能撞宿主 `OPERATION_BUSY`。
+- 重启是危险动作，宁可不动：确认要两次分开的点击（首次进入 confirm 态并记 `restartArmedAt`，800ms 内的点击一律忽略，R48）；预检必须读到 `done` 才算通过，空 body / 半截流一律不重启（R49）；非 2xx 的原因依次取 `body.error ?? body.message ?? 纯文本 ?? 「HTTP n」`（R50，dsh-restart 真实契约是 `{ ok:false, error }`）；status 的「404 没装」与「连不上」分开提示。
+- 重启链在途时按住所有能起新工作的入口（R51）：`startBatch`、`runHostUpgrade`、`hostUpgradeDisabled` 都看 `restartRunning`，`setRestartBusy` 同时禁用「全部升级 / 重新检查 / 预发布 / 本体升级」——否则 `POST restart` 可能落在安装中途，留下半装。
 
 ## 维护
 

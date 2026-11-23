@@ -1421,7 +1421,7 @@ async function runRestartChain(
       headers: { ...RESTART_HEADERS },
     })
   } catch {
-    if (live(view, token)) onManual('没找到 dsh-restart')
+    if (live(view, token)) onManual('连不上 dsh-restart')
     return
   }
   if (!live(view, token)) return
