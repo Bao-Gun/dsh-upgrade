@@ -13,20 +13,13 @@ import {
   readHostInfo,
   readTargetManifest,
   type HostInfo,
-  type RegistryInfo,
 } from './host'
+import { releaseUpgrade, tryAcquireUpgrade } from './lock'
 import { markPending } from './notify'
 import { fetchReleases, type ReleaseEntry } from './releases'
 import { rootDir, writeLast } from './state'
+import { surveyOf, type Blocked } from './survey'
 import { runUpgrade, type UpgradeEvent } from './upgrade'
-import {
-  channelOf,
-  compareVersions,
-  describeEnginesFailure,
-  pickNewest,
-  satisfiesNodeRange,
-  type Channel,
-} from './versions'
 
 export const STATUS_PATH = '/dsh-upgrade/api/status'
 export const CHECK_PATH = '/dsh-upgrade/api/check'
@@ -81,24 +74,6 @@ export type RouteDeps = {
 }
 
 type ResolvedDeps = Required<RouteDeps>
-
-type Blocked = { code: string; message: string }
-
-type Candidate = {
-  version: string
-  channel: Channel
-  publishedAt: string | null
-  blocked?: Blocked
-}
-
-type Survey = {
-  current: string
-  channels: { latest: string | null; next: string | null; alpha: string | null }
-  target: string
-  blocked?: Blocked
-  includePrerelease: boolean
-  candidates: Candidate[]
-}
 
 /** 宿主错误码白名单：只有这些文案是我们自己写的，能安全回给页面。 */
 const SAFE_ERROR_CODES = new Set([
@@ -188,7 +163,8 @@ function statusHandler(deps: ResolvedDeps): RouteHandler {
         current: survey.current,
         channels: survey.channels,
         target: survey.target,
-        ...(survey.blocked === undefined ? {} : { blocked: survey.blocked }),
+        // R3：状态接口键集稳定，没有拦因也显式给 null，前端不用判 key 是否存在。
+        blocked: survey.blocked ?? null,
         includePrerelease: survey.includePrerelease,
       })
     } catch (error) {
@@ -240,20 +216,14 @@ function releasesHandler(deps: ResolvedDeps): RouteHandler {
   }
 }
 
-/**
- * 单飞：检查与置位必须是同步的（中间没有 await），否则两个并发请求都能过门。
- * 任何出口都走 finally 复位，升级抛错不会把锁永久占住。
- */
-let running = false
-
 function upgradeHandler(deps: ResolvedDeps): RouteHandler {
   return async (req, res) => {
     if (!guard(req, res, 'POST')) return
-    if (running) {
+    // R24：单飞锁与 agent 工具共用（lock.ts），页面升级中 agent 也进不来。
+    if (!tryAcquireUpgrade()) {
       respondJson(res, 409, { code: 'BUSY', message: '已有一轮升级在进行，等它结束再试' })
       return
     }
-    running = true
 
     try {
       const body = bodyOf(req)
@@ -317,7 +287,7 @@ function upgradeHandler(deps: ResolvedDeps): RouteHandler {
       await settleLast(result, target, deps.now()).catch(() => {})
       safeEnd(res)
     } finally {
-      running = false
+      releaseUpgrade()
     }
   }
 }
@@ -341,78 +311,6 @@ async function settleLast(
     running: false,
     lastError: { code: error.code, message: error.message, at: now },
   })
-}
-
-/** 只挑出确实比当前新的版本；读不懂的版本号按不存在处理。 */
-function newerVersions(versions: string[], current: string): string[] {
-  const newer: string[] = []
-  for (const version of versions) {
-    try {
-      if (compareVersions(version, current) > 0) newer.push(version)
-    } catch {
-      // 坏版本号不影响其它候选
-    }
-  }
-  return newer
-}
-
-/**
- * 状态与 check 共用同一套判定：稳定通道优先；没有更新就留在当前版本。
- * blocked 说的是「比当前新的那个版本」被 engines 拦住，与 target 是否选中它无关，
- * 这样 includePrerelease=false 时页面仍能解释清为什么升级按钮不可点。
- */
-async function surveyOf(
-  current: string,
-  info: RegistryInfo,
-  includePrerelease: boolean,
-  deps: ResolvedDeps,
-): Promise<Survey> {
-  const channels = {
-    latest: info.channels.latest ?? null,
-    next: info.channels.next ?? null,
-    alpha: info.channels.alpha ?? null,
-  }
-  const newer = newerVersions(info.versions, current)
-  const target = pickNewest(newer, { includePrerelease }) ?? current
-  const probe = target !== current ? target : pickNewest(newer, { includePrerelease: true })
-
-  let blocked: Blocked | undefined
-  if (probe !== null && probe !== current) {
-    try {
-      const engines = (await deps.readTargetManifest(probe)).engines?.node ?? null
-      const node = deps.nodeVersion()
-      if (engines !== null && !satisfiesNodeRange(engines, node)) {
-        blocked = {
-          code: 'RUNTIME_UNSUPPORTED',
-          message: describeEnginesFailure(engines, node),
-        }
-      }
-    } catch {
-      // 读不到 engines 不等于被拦：升级状态机在安装前还会再校验一次。
-    }
-  }
-
-  const candidates: Candidate[] = newer
-    .slice()
-    .sort((a, b) => compareVersions(b, a))
-    .map((version) => ({
-      version,
-      channel: channelOf(version),
-      publishedAt: info.publishedAt[version] ?? null,
-    }))
-  if (blocked !== undefined && probe !== null) {
-    const candidate = candidates.find((item) => item.version === probe)
-    if (candidate !== undefined) candidate.blocked = blocked
-  }
-
-  return {
-    current,
-    channels,
-    target,
-    ...(blocked === undefined ? {} : { blocked }),
-    includePrerelease,
-    candidates,
-  }
 }
 
 function guard(req: RouteRequest, res: RouteResponse, expected: 'GET' | 'POST'): boolean {
