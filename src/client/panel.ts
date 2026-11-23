@@ -11,7 +11,13 @@
  * .dshu-error 红条或 .dshu-notice 提示。
  */
 
-import { DEFAULT_POLL_INTERVAL_MS, DEFAULT_STALLED_WAIT_MS, type BatchItem } from './batch'
+import {
+  DEFAULT_POLL_INTERVAL_MS,
+  DEFAULT_STALLED_WAIT_MS,
+  runBatch,
+  type BatchItem,
+  type BatchSummary,
+} from './batch'
 import { fetchPluginUpdates, type PluginUpdate, type PluginUpdates } from './market'
 
 export type PanelState = {
@@ -110,6 +116,13 @@ const STYLE_TEXT = [
   '.dshu-release-link{color:var(--dsw-alias-state-business-primary,#4d6bfe);text-decoration:none;font-size:13px}',
   '.dshu-release-hint{display:flex;gap:8px;align-items:center;color:var(--dsw-alias-label-secondary,inherit)}',
   '.dshu-plugin-list{display:flex;flex-direction:column;gap:8px}',
+  '.dshu-plugins-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0}',
+  '.dshu-plugins-head h3{margin:0}',
+  '.dshu-plugins-head .dshu-upgrade-all{margin-left:auto}',
+  '.dshu-upgrade-all,.dshu-restart{padding:4px 10px;font-size:12px;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.12));border-radius:var(--dsw-radius-sm,6px);background:transparent;color:inherit;font:inherit;cursor:pointer}',
+  '.dshu-upgrade-all:disabled{opacity:.5;cursor:default}',
+  '.dshu-plugin-summary{font-size:12px;color:var(--dsw-alias-label-tertiary,inherit)}',
+  '.dshu-plugin-summary[hidden]{display:none}',
   '.dshu-plugin{display:flex;flex-direction:column;gap:4px;padding:10px;border-radius:var(--dsw-radius-sm,6px);background:var(--dsw-alias-bg-layer-2,rgba(0,0,0,.03))}',
   '.dshu-plugin-line{display:flex;justify-content:space-between;gap:10px;align-items:baseline}',
   '.dshu-plugin-name{font-weight:600;overflow:hidden;text-overflow:ellipsis}',
@@ -178,6 +191,12 @@ type View = {
   hostFill: HTMLElement
   pluginHead: HTMLElement
   pluginList: HTMLElement
+  /** 批量事件按名字找回自己那一行；重画列表时整张表重建。 */
+  rows: Map<string, PluginRowView>
+  upgradeAllButton: HTMLButtonElement
+  /** Task 4 接线；这里只把位置占好，平时藏着。 */
+  restartButton: HTMLButtonElement
+  pluginSummary: HTMLElement
   progress: HTMLElement
   notice: HTMLElement
   prerelease: HTMLInputElement
@@ -188,6 +207,7 @@ type View = {
   plugins: PluginUpdates | null
   includePrerelease: boolean
   upgradeBusy: boolean
+  batchBusy: boolean
   token: number
   closed: boolean
   previousOverflow: string
@@ -477,10 +497,19 @@ function buildView(doc: Document, options: PanelOptions): View {
 
   const pluginsSection = element(doc, 'section', 'dshu-section')
   pluginsSection.setAttribute('data-k', 'plugins')
+  // 标题与动作同一行：左边「插件（N 个可更新）」，右边「全部升级」；重启按钮 Task 4 才露头。
+  const pluginsHead = element(doc, 'div', 'dshu-plugins-head')
   const pluginHead = doc.createElement('h3')
+  pluginHead.className = 'dshu-plugin-head'
   pluginHead.textContent = '插件'
+  const upgradeAllButton = buttonOf(doc, 'dshu-upgrade-all', '全部升级')
+  const restartButton = buttonOf(doc, 'dshu-restart', '重启 DSH')
+  restartButton.hidden = true
+  pluginsHead.append(pluginHead, upgradeAllButton, restartButton)
   const pluginList = element(doc, 'div', 'dshu-plugin-list')
-  pluginsSection.append(pluginHead, pluginList)
+  const pluginSummary = element(doc, 'div', 'dshu-plugin-summary')
+  pluginSummary.hidden = true
+  pluginsSection.append(pluginsHead, pluginList, pluginSummary)
 
   const progress = element(doc, 'div', 'dshu-progress')
   progress.hidden = true
@@ -508,6 +537,10 @@ function buildView(doc: Document, options: PanelOptions): View {
     hostFill,
     pluginHead,
     pluginList,
+    rows: new Map<string, PluginRowView>(),
+    upgradeAllButton,
+    restartButton,
+    pluginSummary,
     progress,
     notice,
     prerelease,
@@ -518,6 +551,7 @@ function buildView(doc: Document, options: PanelOptions): View {
     plugins: null,
     includePrerelease: false,
     upgradeBusy: false,
+    batchBusy: false,
     token: 1,
     closed: false,
     previousOverflow: '',
@@ -534,15 +568,18 @@ function buildView(doc: Document, options: PanelOptions): View {
   overlay.addEventListener('click', (event) => {
     if (event.target === overlay) close(view)
   })
+  upgradeAllButton.addEventListener('click', () => {
+    void startBatch(view)
+  })
   prerelease.addEventListener('change', () => {
     // 升级进行中重查会用旧 survey 重画，按钮忽隐忽现且点击无效果；直接按住。
-    if (view.upgradeBusy) return
+    if (view.upgradeBusy || view.batchBusy) return
     const token = view.token
     view.includePrerelease = prerelease.checked
     void loadHost(view, token, { check: true, force: false })
   })
   refreshButton.addEventListener('click', () => {
-    if (view.upgradeBusy) return
+    if (view.upgradeBusy || view.batchBusy) return
     const token = view.token
     view.includePrerelease = prerelease.checked
     void loadHost(view, token, { check: true, force: true })
@@ -593,7 +630,7 @@ function emitState(view: View): void {
   const pluginUpdate =
     view.plugins !== null && view.plugins.available && view.plugins.updatable.length > 0
   try {
-    view.options.onState?.({ hasUpdate: hostUpdate || pluginUpdate, busy: view.upgradeBusy })
+    view.options.onState?.({ hasUpdate: hostUpdate || pluginUpdate, busy: view.upgradeBusy || view.batchBusy })
   } catch {
     // 角标刷新失败不影响面板本身。
   }
@@ -797,24 +834,33 @@ function renderReleases(view: View, reply: ReleasesReply): void {
 function renderPlugins(view: View): void {
   const doc = view.doc
   view.pluginList.textContent = ''
+  view.rows.clear()
+  view.pluginSummary.hidden = true
+  view.pluginSummary.textContent = ''
   const plugins = view.plugins
   if (plugins === null) {
     view.pluginHead.textContent = '插件'
+    view.upgradeAllButton.hidden = true
     return
   }
   if (!plugins.available) {
     view.pluginHead.textContent = '插件'
+    view.upgradeAllButton.hidden = true
     view.pluginList.appendChild(element(doc, 'div', 'dshu-plugin-unavailable', '插件更新不可用'))
     return
   }
   view.pluginHead.textContent =
     plugins.updatable.length > 0 ? '插件（' + plugins.updatable.length + ' 个可更新）' : '插件'
   if (plugins.updatable.length === 0) {
+    view.upgradeAllButton.hidden = true
     view.pluginList.appendChild(element(doc, 'div', 'dshu-plugin-empty', '已是最新'))
     return
   }
+  view.upgradeAllButton.hidden = false
   for (const update of plugins.updatable) {
-    view.pluginList.appendChild(createPluginRow(view, update).root)
+    const row = createPluginRow(view, update)
+    view.rows.set(update.name, row)
+    view.pluginList.appendChild(row.root)
   }
 }
 
@@ -961,6 +1007,76 @@ export function paintBatchItem(row: PluginRowView, item: BatchItem): void {
   }
 }
 
+/** R33：一行里把「升成几个、败几个、跳几个」说清；为 0 的那段不写。 */
+function batchSummaryText(summary: BatchSummary): string {
+  const parts: string[] = []
+  if (summary.succeeded.length > 0) parts.push(String(summary.succeeded.length) + ' 个已升级')
+  if (summary.failed.length > 0) parts.push(String(summary.failed.length) + ' 个失败')
+  if (summary.skipped.length > 0) parts.push(String(summary.skipped.length) + ' 个跳过')
+  if (summary.restartRequired && summary.succeeded.length > 0) parts.push('需重启生效')
+  return parts.join('，')
+}
+
+/** 批量忙时按住所有会重画或并发起升级的入口；本体忙时反过来按住「全部升级」。 */
+function setBatchBusy(view: View, busy: boolean): void {
+  view.batchBusy = busy
+  view.upgradeAllButton.disabled = busy || view.upgradeBusy
+  view.upgradeAllButton.textContent = busy ? '升级中…' : '全部升级'
+  view.prerelease.disabled = busy || view.upgradeBusy
+  view.refreshButton.disabled = busy || view.upgradeBusy
+  if (view.upgradeButton !== null) {
+    if (busy) {
+      view.upgradeButton.disabled = true
+    } else {
+      const blocked = view.survey !== null && view.survey.blocked !== null
+      view.upgradeButton.disabled = blocked || !hasNewerTarget(view.survey)
+    }
+  }
+  emitState(view)
+}
+
+/**
+ * 「全部升级」：先把每行清成 pending（上一轮的结果不能留在屏幕上），再串行跑。
+ * 事件只改对应名字的那一行；面板关了就停手，剩下的包由 runBatch 记成 skipped。
+ */
+async function startBatch(view: View): Promise<void> {
+  if (view.batchBusy || view.upgradeBusy) return
+  const plugins = view.plugins
+  if (plugins === null || !plugins.available || plugins.updatable.length === 0) return
+  const names = plugins.updatable.map((update) => update.name)
+  const token = view.token
+  for (const [name, row] of view.rows) {
+    paintBatchItem(row, { name, state: 'pending', percent: null, detail: null, message: null, unavailable: false })
+  }
+  setBatchBusy(view, true)
+  view.pluginSummary.hidden = true
+  view.pluginSummary.textContent = ''
+
+  let summary: BatchSummary
+  try {
+    summary = await runBatch(names, fetchOf(view.doc), view.options.apiBase ?? '', {
+      pollIntervalMs: view.options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
+      stalledWaitMs: view.options.stalledWaitMs ?? DEFAULT_STALLED_WAIT_MS,
+      cancelled: () => view.closed,
+      onEvent: (event) => {
+        if (!live(view, token)) return
+        const row = view.rows.get(event.item.name)
+        if (row !== undefined) paintBatchItem(row, event.item)
+      },
+    })
+  } catch {
+    if (!live(view, token)) return
+    setBatchBusy(view, false)
+    showError(view, '批量升级请求失败，请检查网络后重试')
+    return
+  }
+  if (!live(view, token)) return
+  setBatchBusy(view, false)
+  const text = batchSummaryText(summary)
+  view.pluginSummary.textContent = text
+  view.pluginSummary.hidden = text === ''
+}
+
 async function loadHost(
   view: View,
   token: number,
@@ -1036,7 +1152,7 @@ async function loadPlugins(view: View, token: number): Promise<void> {
 
 async function runHostUpgrade(view: View, token: number): Promise<void> {
   const survey = view.survey
-  if (survey === null || !hasNewerTarget(survey) || view.upgradeBusy) return
+  if (survey === null || !hasNewerTarget(survey) || view.upgradeBusy || view.batchBusy) return
   const target = survey.target
   const f = fetchOf(view.doc)
   const base = view.options.apiBase ?? ''
@@ -1045,6 +1161,7 @@ async function runHostUpgrade(view: View, token: number): Promise<void> {
   if (view.upgradeButton !== null) view.upgradeButton.disabled = true
   view.prerelease.disabled = true
   view.refreshButton.disabled = true
+  view.upgradeAllButton.disabled = true
   clearError(view)
   setNotice(view, '')
   resetProgress(view)
@@ -1086,8 +1203,9 @@ function finishHostBusy(view: View): void {
   // 本体这一轮到此结束（含预检与重启请求），阶段条收起来，剩下的用文字进度说话。
   hideHostProgress(view)
   view.upgradeBusy = false
-  view.prerelease.disabled = false
-  view.refreshButton.disabled = false
+  view.prerelease.disabled = view.batchBusy
+  view.refreshButton.disabled = view.batchBusy
+  view.upgradeAllButton.disabled = view.batchBusy
   if (view.upgradeButton !== null) {
     const blocked = view.survey !== null && view.survey.blocked !== null
     view.upgradeButton.disabled = blocked || !hasNewerTarget(view.survey)

@@ -92,8 +92,10 @@ function controlledStream(): { response: FakeResponse, push: (text: string) => v
   }
 }
 
-/** routes 的键是 "METHOD /path"。没命中的路由回 404。 */
-function serve(routes: Record<string, (init: FakeInit) => FakeResponse>): Call[] {
+/** routes 的键是 "METHOD /path"。没命中的路由回 404；处理器第二个参数是原始 url。 */
+type RouteHandler = (init: FakeInit, url: string) => FakeResponse
+
+function serve(routes: Record<string, RouteHandler>): Call[] {
   const calls: Call[] = []
   vi.stubGlobal('fetch', async (input: unknown, init: FakeInit = {}) => {
     const url = String(input)
@@ -103,9 +105,84 @@ function serve(routes: Record<string, (init: FakeInit) => FakeResponse>): Call[]
     calls.push({ url, method, headers, body: init.body === undefined || init.body === null ? undefined : JSON.parse(init.body) })
     const route = routes[method + ' ' + pathOf(url)]
     if (route === undefined) return jsonResponse({ code: 'NOT_FOUND', message: '没有这个路由' }, 404) as unknown as Response
-    return route(init) as unknown as Response
+    return route(init, url) as unknown as Response
   })
   return calls
+}
+
+/** 一个操作在某一轮轮询里的样子；数组的末项会被重复返回，直到测试中途 push 新项。 */
+type OperationStep = {
+  state: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'rolled-back'
+  percent?: number
+  wait?: { code?: string, message?: string, activeAgentIds?: string[] }
+  failure?: { code?: string, message?: string }
+  restartRequired?: boolean
+}
+
+type BatchRoutesOptions = {
+  /** summary 里按这个顺序给可更新的包。 */
+  packages?: string[]
+  /** 每个包自己的轮询剧本；不写就是「先 running 一次，再一次 succeeded」。 */
+  steps?: Record<string, OperationStep[]>
+  /** POST 直接以这个状态码失败（模拟请求层不可用）。 */
+  postStatus?: number
+  onPost?: (name: string) => void
+  onPoll?: (name: string, index: number) => void
+}
+
+/**
+ * 市场三端点的桩：POST 立刻 202 给 operationId，GET operations 按每个包自己的
+ * 剧本逐个返回，summary 给出给定包。steps 的数组可以在测试中途 push，用来放行
+ * 一直 running 的包。
+ */
+function batchRoutes(options: BatchRoutesOptions = {}): Record<string, RouteHandler> {
+  const names = options.packages ?? ['a', 'b']
+  const steps = options.steps ?? {}
+  const polls: Record<string, number> = {}
+  return {
+    'GET /dsh-upgrade/api/status': () => jsonResponse(SURVEY_UPDATE),
+    'GET /dsh-upgrade/api/releases': () => jsonResponse(RELEASES),
+    'GET /dsh-market/api/v1/updates/summary': () =>
+      jsonResponse({
+        schema: 1,
+        checked: names.length,
+        packages: names.map((name) => ({
+          name,
+          source: 'npm',
+          installedVersion: '1.0.0',
+          latestVersion: '1.1.0',
+        })),
+      }),
+    'POST /dsh-market/api/v1/updates': (init) => {
+      const body = init.body === undefined || init.body === null ? null : (JSON.parse(init.body) as { packageName?: string })
+      const name = body?.packageName ?? ''
+      options.onPost?.(name)
+      if (options.postStatus !== undefined) {
+        return jsonResponse({ code: 'MARKET_UNAVAILABLE', message: '插件更新不可用' }, options.postStatus)
+      }
+      return jsonResponse({ operation: { operationId: 'op-' + name } }, 202)
+    },
+    'GET /dsh-market/api/v1/operations': (_init, url) => {
+      const operationId = new URL(url, 'http://localhost').searchParams.get('operationId') ?? ''
+      const name = operationId.startsWith('op-') ? operationId.slice(3) : ''
+      const index = polls[name] ?? 0
+      polls[name] = index + 1
+      options.onPoll?.(name, index)
+      const list = steps[name] ?? [{ state: 'running' }, { state: 'succeeded' }]
+      const fallback: OperationStep = { state: 'succeeded' }
+      const step = list[Math.min(index, Math.max(list.length - 1, 0))] ?? fallback
+      return jsonResponse({
+        operation: {
+          operationId,
+          state: step.state,
+          outcome: { restartRequired: step.restartRequired === true },
+          ...(step.percent !== undefined ? { progress: { percent: step.percent } } : {}),
+          ...(step.wait !== undefined ? { wait: step.wait } : {}),
+          ...(step.failure !== undefined ? { failure: step.failure } : {}),
+        },
+      })
+    },
+  }
 }
 
 function callsTo(calls: Call[], method: string, path: string): Call[] {
@@ -513,6 +590,201 @@ describe('插件段', () => {
     expect(shown).not.toContain('The installed version')
     expect(shown).not.toContain('升级失败：')
     expect(row.state.getAttribute('title')).toContain(en)
+    closePanel()
+  })
+})
+
+describe('全部升级', () => {
+  test('全部升级按钮与插件标题同一行，点下去按列表顺序串行起包', async () => {
+    const calls = serve(batchRoutes({ packages: ['a', 'b'] }))
+    await openPanel(document)
+
+    const button = document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')
+    expect(button).not.toBeNull()
+    expect(button?.textContent).toBe('全部升级')
+    const head = document.querySelector('.dshu-plugins-head')
+    expect(head).not.toBeNull()
+    expect(button?.parentElement).toBe(head)
+    expect(head?.querySelector('.dshu-plugin-head')?.textContent).toContain('插件（2 个可更新）')
+    // 列表换行在下面，不能挤进标题这一行。
+    const list = document.querySelector('.dshu-plugin-list')
+    expect(list).not.toBeNull()
+    expect(head?.contains(list)).toBe(false)
+    expect(button?.parentElement?.children).not.toContain(list)
+
+    button?.click()
+    await waitFor(() => callsTo(calls, 'POST', '/dsh-market/api/v1/updates').length === 2)
+    expect(callsTo(calls, 'POST', '/dsh-market/api/v1/updates').map((call) => call.body)).toEqual([
+      { packageName: 'a' },
+      { packageName: 'b' },
+    ])
+    closePanel()
+  })
+
+  test('升级中按钮与本体控件一起按住，结束全部恢复', async () => {
+    const steps: Record<string, OperationStep[]> = { a: [{ state: 'running', percent: 10 }] }
+    serve(batchRoutes({ packages: ['a', 'b'], steps }))
+    await openPanel(document, { pollIntervalMs: 10 })
+
+    const button = document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')
+    const toggle = document.querySelector<HTMLInputElement>('.dshu-prerelease')
+    const refresh = document.querySelector<HTMLButtonElement>('.dshu-refresh')
+    const host = upgradeButton()
+    expect(host).not.toBeNull()
+
+    button?.click()
+    await waitFor(() => button?.disabled === true)
+    expect(button?.textContent).toBe('升级中…')
+    expect(toggle?.disabled).toBe(true)
+    expect(refresh?.disabled).toBe(true)
+    expect(host?.disabled).toBe(true)
+
+    steps['a']?.push({ state: 'succeeded' })
+    await waitFor(() => button?.disabled === false)
+    expect(button?.textContent).toBe('全部升级')
+    expect(toggle?.disabled).toBe(false)
+    expect(refresh?.disabled).toBe(false)
+    expect(host?.disabled).toBe(false)
+    closePanel()
+  })
+
+  test('每个插件只画自己那一行的进度', async () => {
+    const steps: Record<string, OperationStep[]> = {
+      a: [
+        { state: 'running', percent: 42.6 },
+        { state: 'running', percent: 42.6 },
+        { state: 'running', percent: 42.6 },
+        { state: 'succeeded' },
+      ],
+      b: [{ state: 'succeeded' }],
+    }
+    serve(batchRoutes({ packages: ['a', 'b'], steps }))
+    await openPanel(document, { pollIntervalMs: 20 })
+
+    document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')?.click()
+    await waitFor(
+      () => document.querySelector<HTMLElement>('[data-name="a"] .dshu-bar-fill')?.style.width === '43%',
+    )
+    expect(document.querySelector<HTMLElement>('[data-name="b"] .dshu-bar')?.hidden).toBe(true)
+    closePanel()
+  })
+
+  test('中途失败继续升后面的，最后一行把数说清', async () => {
+    serve(batchRoutes({
+      packages: ['a', 'b', 'c'],
+      steps: {
+        a: [{ state: 'succeeded' }],
+        b: [{ state: 'failed', failure: { code: 'INSTALL_FAILED', message: '磁盘写满' } }],
+        c: [{ state: 'succeeded' }],
+      },
+    }))
+    await openPanel(document, { pollIntervalMs: 10 })
+
+    document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')?.click()
+    await waitFor(() => (document.querySelector('.dshu-plugin-summary')?.textContent ?? '').includes('1 个失败'))
+
+    const failed = document.querySelector<HTMLElement>('[data-name="b"] .dshu-plugin-state')
+    expect(failed?.hasAttribute('data-error')).toBe(true)
+    expect(failed?.textContent).toContain('磁盘写满')
+    expect(document.querySelector('[data-name="c"] .dshu-plugin-state')?.textContent).toBe('已升级')
+    const summary = document.querySelector<HTMLElement>('.dshu-plugin-summary')
+    expect(summary?.hidden).toBe(false)
+    expect(summary?.textContent).toContain('2 个已升级')
+    expect(summary?.textContent).toContain('1 个失败')
+    closePanel()
+  })
+
+  test('AGENTS_RUNNING 的双语只留中文首句，英文全文进 title', async () => {
+    const message =
+      '有 agent 正在运行（session-abc）。更新会直接替换插件文件，先等它结束。 / ' +
+      'Agents are running (session-abc). Updating replaces plugin files in place; wait for it to finish.'
+    serve(batchRoutes({
+      packages: ['a'],
+      steps: { a: [{ state: 'failed', failure: { code: 'AGENTS_RUNNING', message } }] },
+    }))
+    await openPanel(document, { pollIntervalMs: 10 })
+
+    document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')?.click()
+    await waitFor(() => (document.querySelector('[data-name="a"] .dshu-plugin-state')?.textContent ?? '') !== '')
+
+    const state = document.querySelector<HTMLElement>('[data-name="a"] .dshu-plugin-state')
+    expect(state?.textContent).toContain('有 agent 正在运行')
+    expect(state?.textContent).not.toContain('Agents are running')
+    expect(state?.getAttribute('title')).toContain('Agents are running')
+    closePanel()
+  })
+
+  test('请求层不可用只说不熟，不画成安装失败的红字', async () => {
+    serve(batchRoutes({ packages: ['a'], postStatus: 500 }))
+    await openPanel(document, { pollIntervalMs: 10 })
+
+    document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')?.click()
+    await waitFor(
+      () => document.querySelector('[data-name="a"] .dshu-plugin-state')?.textContent === '插件更新不可用',
+    )
+
+    const state = document.querySelector<HTMLElement>('[data-name="a"] .dshu-plugin-state')
+    expect(state?.hasAttribute('data-error')).toBe(false)
+    closePanel()
+  })
+
+  test('批量进行中关面板：剩下的包不再发请求，也不抛错', async () => {
+    const calls = serve(batchRoutes({
+      packages: ['a', 'b'],
+      // 第一个包成功那一刻就关面板：批量循环在同一串微任务里立刻会去起第二个包，
+      // 从 DOM 外面等「已升级」再关是来不及的。
+      onPoll: (name, index) => {
+        if (name === 'a' && index === 0) closePanel()
+      },
+    }))
+    await openPanel(document, { pollIntervalMs: 10 })
+
+    document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')?.click()
+    await waitFor(() => callsTo(calls, 'POST', '/dsh-market/api/v1/updates').length >= 1)
+    await new Promise((resolve) => setTimeout(resolve, 40))
+
+    expect(callsTo(calls, 'POST', '/dsh-market/api/v1/updates')).toHaveLength(1)
+    expect(document.querySelector('.dshu-overlay')).toBeNull()
+  })
+
+  test('排队时行里说清在等几个运行中的会话', async () => {
+    serve(batchRoutes({
+      packages: ['a'],
+      steps: {
+        a: [
+          {
+            state: 'queued',
+            wait: { code: 'AGENTS_RUNNING', message: '有 agent 正在运行', activeAgentIds: ['s1', 's2'] },
+          },
+          { state: 'succeeded' },
+        ],
+      },
+    }))
+    await openPanel(document, { pollIntervalMs: 40 })
+
+    document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')?.click()
+    await waitFor(() =>
+      (document.querySelector('[data-name="a"] .dshu-plugin-progress-text')?.textContent ?? '').includes(
+        '等 2 个运行中的会话结束',
+      ),
+    )
+    closePanel()
+  })
+
+  test('点全部升级的瞬间先清掉上一轮的残留文案', async () => {
+    const steps: Record<string, OperationStep[]> = { a: [{ state: 'succeeded' }] }
+    serve(batchRoutes({ packages: ['a'], steps }))
+    await openPanel(document, { pollIntervalMs: 10 })
+
+    const button = document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')
+    button?.click()
+    await waitFor(() => document.querySelector('[data-name="a"] .dshu-plugin-state')?.textContent === '已升级')
+    await waitFor(() => button?.disabled === false)
+
+    button?.click()
+    // 同步断言：第一次 await 之前就得把上一轮画的东西清掉。
+    expect(document.querySelector<HTMLElement>('[data-name="a"] .dshu-plugin-state')?.textContent).toBe('')
+    expect(document.querySelector<HTMLElement>('[data-name="a"] .dshu-plugin-progress')?.hidden).toBe(true)
     closePanel()
   })
 })
