@@ -203,8 +203,36 @@ describe('面板骨架与本体段', () => {
     closePanel()
   })
 
-  test('没有更新时本体段显示已是最新、升级按钮消失、段落还在', async () => {
+  test('发布页链接只接受 http(s)，javascript: 不写进 href', async () => {
     serve({
+      ...fullRoutes(),
+      'GET /dsh-upgrade/api/releases': () =>
+        jsonResponse({
+          releases: [
+            {
+              version: '0.2.3-alpha.2',
+              channel: 'alpha',
+              publishedAt: '2026-11-20T10:00:00Z',
+              items: ['新增升级面板'],
+              url: 'javascript:alert(1)',
+            },
+          ],
+          degraded: false,
+        }),
+    })
+
+    await openPanel(document)
+
+    const links = Array.from(document.querySelectorAll('.dshu-release a'))
+    const unsafe = links.filter((link) => (link.getAttribute('href') ?? '').toLowerCase().startsWith('javascript:'))
+    expect(unsafe).toHaveLength(0)
+    expect(document.querySelector('.dshu-release')?.textContent ?? '').toContain('新增升级面板')
+
+    closePanel()
+  })
+
+  test('没有更新时本体段显示已是最新、升级按钮消失、段落还在', async () => {
+    const calls = serve({
       ...fullRoutes(),
       'GET /dsh-upgrade/api/status': () =>
         jsonResponse({ ...SURVEY_UPDATE, target: '0.2.2-rc.5', includePrerelease: false }),
@@ -216,6 +244,7 @@ describe('面板骨架与本体段', () => {
     expect(hostSection()?.textContent).toContain('已是最新')
     expect(upgradeButton()).toBeNull()
     expect(pluginsSection()).not.toBeNull()
+    expect(callsTo(calls, 'GET', '/dsh-upgrade/api/releases')).toHaveLength(0)
 
     closePanel()
   })
@@ -442,6 +471,9 @@ describe('本体升级的 NDJSON 进度', () => {
     const restart = callsTo(calls, 'POST', '/dsh-restart/api/restart')
     expect(restart).toHaveLength(1)
     expect(restart[0]?.headers['x-dsh-restart']).toBe('1')
+    const statusCalls = callsTo(calls, 'GET', '/dsh-restart/api/status')
+    expect(statusCalls).toHaveLength(1)
+    expect(statusCalls[0]?.headers['x-dsh-restart']).toBe('1')
 
     closePanel()
   })
@@ -510,6 +542,34 @@ describe('刷新与预发布开关', () => {
 
     closePanel()
   })
+
+  test('刷新失败保留上一份状态，刷新成功清掉红条', async () => {
+    let checks = 0
+    const calls = serve({
+      ...fullRoutes(),
+      'POST /dsh-upgrade/api/check': () => {
+        checks += 1
+        if (checks === 1) return jsonResponse({ code: 'INTERNAL', message: '读取失败' }, 500)
+        return jsonResponse(SURVEY_UPDATE)
+      },
+    })
+
+    await openPanel(document)
+    expect(hostSection()?.textContent).toContain('0.2.3-alpha.2')
+
+    document.querySelector<HTMLButtonElement>('.dshu-refresh')?.click()
+    await waitFor(() => errorBar() !== null)
+    // 一次抖动不该把升级按钮和版本信息抹掉。
+    expect(hostSection()?.textContent).toContain('0.2.3-alpha.2')
+    expect(upgradeButton()).not.toBeNull()
+
+    document.querySelector<HTMLButtonElement>('.dshu-refresh')?.click()
+    await waitFor(() => errorBar() === null)
+    expect(hostSection()?.textContent).toContain('0.2.3-alpha.2')
+    expect(callsTo(calls, 'POST', '/dsh-upgrade/api/check')).toHaveLength(2)
+
+    closePanel()
+  })
 })
 
 describe('遮罩、关闭与幂等', () => {
@@ -542,6 +602,16 @@ describe('遮罩、关闭与幂等', () => {
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
     expect(document.querySelector('.dshu-overlay')).toBeNull()
   })
+
+  test('关闭时调用 onClose 一次', async () => {
+    serve(fullRoutes())
+    const onClose = vi.fn()
+    await openPanel(document, { onClose })
+
+    document.querySelector<HTMLButtonElement>('.dshu-close')?.click()
+
+    expect(onClose).toHaveBeenCalledTimes(1)
+  })
 })
 
 describe('apply 入口', () => {
@@ -566,7 +636,13 @@ describe('apply 入口', () => {
     })
 
     const cleanups: Array<() => void> = []
-    apply({ effect: (fn) => { cleanups.push(fn as () => void) } })
+    // 跟 cordis 的 Fiber.effect 一样：立刻执行传入函数，把返回值当 disposer。
+    apply({
+      effect: (fn) => {
+        const disposer = fn() as unknown
+        if (typeof disposer === 'function') cleanups.push(disposer as unknown as () => void)
+      },
+    })
 
     // 状态还没回来，入口已经在了：这就是 mount → fetch → setEntryState 的顺序。
     const entry = document.querySelector('[data-dshu-entry]')
@@ -591,7 +667,13 @@ describe('apply 入口', () => {
     })
 
     const cleanups: Array<() => void> = []
-    apply({ effect: (fn) => { cleanups.push(fn as () => void) } })
+    // 跟 cordis 的 Fiber.effect 一样：立刻执行传入函数，把返回值当 disposer。
+    apply({
+      effect: (fn) => {
+        const disposer = fn() as unknown
+        if (typeof disposer === 'function') cleanups.push(disposer as unknown as () => void)
+      },
+    })
 
     await waitFor(() => document.querySelector('[data-dshu-entry]')?.getAttribute('data-has-update') === '1')
     while (cleanups.length > 0) cleanups.pop()?.()
@@ -611,7 +693,13 @@ describe('apply 入口', () => {
     })
 
     const cleanups: Array<() => void> = []
-    apply({ effect: (fn) => { cleanups.push(fn as () => void) } })
+    // 跟 cordis 的 Fiber.effect 一样：立刻执行传入函数，把返回值当 disposer。
+    apply({
+      effect: (fn) => {
+        const disposer = fn() as unknown
+        if (typeof disposer === 'function') cleanups.push(disposer as unknown as () => void)
+      },
+    })
 
     await new Promise((resolve) => setTimeout(resolve, 30))
     expect(document.querySelector('[data-dshu-entry]')?.getAttribute('data-has-update')).toBeNull()

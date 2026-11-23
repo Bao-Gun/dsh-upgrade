@@ -645,6 +645,11 @@ function releaseTagUrl(target: string): string {
   return RELEASE_PAGE + encodeURIComponent(target)
 }
 
+/** 发布页链接只认 http(s)：javascript: 之类的 href 不能进 DOM。 */
+function isHttpUrl(url: string): boolean {
+  return /^https?:\/\//i.test(url)
+}
+
 function renderReleases(view: View, reply: ReleasesReply): void {
   const doc = view.doc
   const box = view.releaseBox
@@ -694,7 +699,7 @@ function renderReleases(view: View, reply: ReleasesReply): void {
       list.appendChild(item)
     }
     body.appendChild(list)
-    if (release.url !== '') {
+    if (release.url !== '' && isHttpUrl(release.url)) {
       const link = doc.createElement('a')
       link.className = 'dshu-release-link'
       link.href = release.url
@@ -776,14 +781,17 @@ async function loadHost(
     }
     if (!live(view, token)) return
     if (!reply.ok) {
-      view.survey = null
-      renderSurvey(view)
-      emitState(view)
+      // 刷新偶尔失败不该把上一份好数据抹掉：角标和升级按钮会跟着凭空消失。
+      if (view.survey === null) {
+        renderSurvey(view)
+        emitState(view)
+      }
       showError(view, '读取版本状态失败（HTTP ' + reply.status + '）')
       return
     }
     const survey = normalizeSurvey(reply.body)
     view.survey = survey
+    clearError(view)
     renderSurvey(view)
     emitState(view)
     if (!live(view, token)) return
@@ -927,6 +935,7 @@ async function continueToRestart(view: View, token: number, target: string): Pro
     status = await f(joinUrl(base, RESTART_STATUS_PATH), {
       method: 'GET',
       credentials: 'same-origin',
+      headers: { ...RESTART_HEADERS },
     })
   } catch {
     if (live(view, token)) manualRestart('没找到 dsh-restart')

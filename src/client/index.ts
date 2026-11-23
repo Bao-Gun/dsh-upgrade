@@ -33,7 +33,9 @@ export function apply(ctx?: ClientContext): void {
   }
 
   if (ctx !== undefined && typeof ctx.effect === 'function') {
-    ctx.effect(stop)
+    // 宿主是 cordis：effect 会立刻执行传入函数，并把它的返回值当 disposer。
+    // 所以这里必须传「返回 stop 的函数」，不能直接传 stop——否则 apply 刚挂上入口就被拆掉。
+    ctx.effect(() => stop)
   } else {
     const view = doc.defaultView
     if (view !== null) view.addEventListener('pagehide', stop, { once: true })
