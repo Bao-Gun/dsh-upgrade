@@ -428,6 +428,94 @@ describe('插件段', () => {
     closePanel()
   })
 
+  test('插件失败原因是中英双语长文时，行里只留中文首句，全文进 title', async () => {
+    const zh =
+      '有 agent 正在运行（session-a, session-b）。更新会直接替换插件文件，正在工作的 agent 可能在执行中途读到缺失或新版本的文件而报错；请等它完成或取消后再更新。'
+    const en =
+      'Agents are running (session-a, session-b). Updating replaces plugin files in place, so a working agent can fail or mix versions mid-turn; wait for it to finish (or cancel it) before updating.'
+    serve({
+      ...fullRoutes(),
+      'POST /dsh-market/api/v1/updates': () => jsonResponse({ schema: 1, operation: { operationId: 'op-1' } }),
+      'GET /dsh-market/api/v1/operations': () =>
+        jsonResponse({
+          operation: {
+            state: 'failed',
+            operationId: 'op-1',
+            failure: { code: 'AGENTS_RUNNING', message: zh + ' / ' + en, retryable: true },
+          },
+        }),
+    })
+
+    await openPanel(document, { pollIntervalMs: 1 })
+    document.querySelector<HTMLButtonElement>('.dshu-plugin-upgrade')?.click()
+
+    await waitFor(() => (pluginsSection()?.textContent ?? '').includes('有 agent 正在运行'))
+    const state = document.querySelector('.dshu-plugin .dshu-plugin-state')
+    const shown = state?.textContent ?? ''
+    expect(shown.startsWith('升级失败：有 agent 正在运行')).toBe(true)
+    expect(shown).not.toContain('Agents are running')
+    expect(shown.length).toBeLessThan(130)
+    expect(state?.getAttribute('title')).toContain('Agents are running')
+
+    closePanel()
+  })
+
+  test('排队等会话结束且一直没推进时解锁按钮，并说清还没开始', async () => {
+    serve({
+      ...fullRoutes(),
+      'POST /dsh-market/api/v1/updates': () => jsonResponse({ schema: 1, operation: { operationId: 'op-1' } }),
+      'GET /dsh-market/api/v1/operations': () =>
+        jsonResponse({
+          operation: {
+            state: 'queued',
+            operationId: 'op-1',
+            wait: { code: 'AGENTS_ACTIVE', message: null, activeAgentIds: ['session-a', 'session-b'] },
+          },
+        }),
+    })
+
+    await openPanel(document, { pollIntervalMs: 1, stalledWaitMs: 0 })
+    const button = document.querySelector<HTMLButtonElement>('.dshu-plugin-upgrade')
+    button?.click()
+
+    await waitFor(() => (pluginsSection()?.textContent ?? '').includes('还没开始升级'))
+    const row = document.querySelector('.dshu-plugin')
+    expect(row?.textContent).toContain('等 2 个运行中的会话结束后再点')
+    // 卡住时必须解锁，否则按钮灰着又没人在装，用户只能刷新页面。
+    expect(button?.disabled).toBe(false)
+    expect(row?.querySelector('.dshu-plugin-state')?.hasAttribute('data-error')).toBe(false)
+    expect(row?.querySelector<HTMLElement>('.dshu-bar')?.hidden).toBe(true)
+
+    closePanel()
+  })
+
+  test('进度一直在动时不会误判成卡住', async () => {
+    let polls = 0
+    serve({
+      ...fullRoutes(),
+      'POST /dsh-market/api/v1/updates': () => jsonResponse({ schema: 1, operation: { operationId: 'op-1' } }),
+      'GET /dsh-market/api/v1/operations': () => {
+        polls += 1
+        if (polls === 1) {
+          return jsonResponse({ operation: { state: 'running', operationId: 'op-1', progress: { done: 1, total: 4 } } })
+        }
+        if (polls === 2) {
+          return jsonResponse({ operation: { state: 'running', operationId: 'op-1', progress: { done: 3, total: 4 } } })
+        }
+        return jsonResponse({ operation: { state: 'succeeded', operationId: 'op-1' } })
+      },
+    })
+
+    await openPanel(document, { pollIntervalMs: 1, stalledWaitMs: 0 })
+    const button = document.querySelector<HTMLButtonElement>('.dshu-plugin-upgrade')
+    button?.click()
+
+    await waitFor(() => (pluginsSection()?.textContent ?? '').includes('已升级'))
+    expect(button?.disabled).toBe(false)
+
+    closePanel()
+  })
+
   test('插件回滚也写在这一行，并明确说了已回滚', async () => {
     serve({
       ...fullRoutes(),

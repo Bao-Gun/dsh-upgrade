@@ -257,6 +257,24 @@ describe('pollPluginOperation', () => {
     expect(calls[0]?.init?.credentials).toBe('same-origin')
   })
 
+  test('宿主只给 done/total 时自己折算 percent，别当成没有进度', async () => {
+    const { fetchImpl } = fakeFetch(() =>
+      jsonResponse({
+        schema: 'dsh-market/update-api/v1',
+        operation: {
+          operationId: 'boot-1-update-2',
+          state: 'running',
+          progress: { phase: 'install', done: 3, total: 4 },
+        },
+      }),
+    )
+
+    const operation = await pollPluginOperation('boot-1-update-2', fetchImpl)
+    expect(operation.progress?.percent).toBe(75)
+    expect(operation.progress?.done).toBe(3)
+    expect(operation.progress?.phase).toBe('install')
+  })
+
   test('带回 rolled-back 与 restartRequired', async () => {
     const { fetchImpl } = fakeFetch(() =>
       jsonResponse({

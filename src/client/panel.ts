@@ -31,6 +31,12 @@ export type PanelOptions = {
   apiBase?: string
   /** 插件升级的轮询间隔（毫秒）；测试里调小。 */
   pollIntervalMs?: number
+  /**
+   * 操作没有任何推进（状态、百分比、pnpm 输出都不变）多久就停止等待并解锁按钮。
+   * 市场上一个操作可能卡在「等运行中的会话结束」，没人来就不会自己往前走；
+   * 这里不无限期把按钮钉死。
+   */
+  stalledWaitMs?: number
   /** 面板算出的底栏角标状态；没有入口时什么都不发生。 */
   onState?(state: PanelState): void
   /** 面板关闭后回调。 */
@@ -63,6 +69,8 @@ const RELEASE_PAGE = 'https://github.com/deepseek-ai/deepseek-harness/releases/t
 const DEFAULT_POLL_INTERVAL_MS = 800
 /** 一轮升级最多盯这么久（约 20 分钟），防止流断在半路时无限轮询。 */
 const MAX_POLLS = 1500
+/** 默认 3 分钟没推进就解锁：pnpm 会不停报进度，真卡住的多半是在等会话结束。 */
+const DEFAULT_STALLED_WAIT_MS = 180_000
 
 const PHASE_LABELS: Record<string, string> = {
   backup: '备份',
@@ -855,10 +863,23 @@ function createPluginRow(view: View, update: PluginUpdate): PluginRowView {
 }
 
 /** 行内状态：失败用红字，并且清掉上一轮的进度条。 */
-function setRowState(row: PluginRowView, text: string, isError = false): void {
+function setRowState(row: PluginRowView, text: string, isError = false, full?: string): void {
   row.state.textContent = text
+  row.state.title = full ?? ''
   if (isError) row.state.setAttribute('data-error', '')
   else row.state.removeAttribute('data-error')
+}
+
+/**
+ * 宿主失败正文常常是几百字的中英双语，用 " / " 拼在一起；行里只留中文首句，
+ * 长话截断，全文挂在 title 上——一行红字塞满整个面板反而读不出是哪一步失败。
+ */
+function compactReason(raw: string, limit = 90): string {
+  const zh = raw.split(' / ')[0] ?? raw
+  const flat = zh.replace(/\s+/g, ' ').trim()
+  if (flat === '') return ''
+  if (flat.length <= limit) return flat
+  return flat.slice(0, limit - 1) + '…'
 }
 
 /** percent 为 null 表示 pnpm 还没报总量：画不确定进度（来回跑），不假装 0%。 */
@@ -1177,10 +1198,24 @@ async function runPluginUpdate(
     }
 
     const interval = view.options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS
+    const stalledWaitMs = view.options.stalledWaitMs ?? DEFAULT_STALLED_WAIT_MS
+    let lastMove = ''
+    let movedAt = Date.now()
     for (let round = 0; round < MAX_POLLS; round += 1) {
       const operation = await pollPluginOperation(started.operationId, f, base)
       if (!live(view, token)) return
       if (operation.status === 'queued' || operation.status === 'running') {
+        const move = moveKey(operation)
+        if (move !== lastMove) {
+          lastMove = move
+          movedAt = Date.now()
+        } else if (Date.now() - movedAt >= stalledWaitMs) {
+          // 卡在「等会话结束」这类前进不了的地方：解锁按钮，把原因留在这一行。
+          setRowState(row, stalledReason(operation))
+          setRowProgress(row, null, false)
+          row.button.disabled = false
+          return
+        }
         paintPluginRunning(row, operation)
         await sleep(interval)
         if (!live(view, token)) return
@@ -1201,6 +1236,28 @@ async function runPluginUpdate(
   }
 }
 
+/** 判定「还在动」的指纹：状态、百分比、pnpm 输出任一变化都算推进。 */
+function moveKey(operation: PluginOperation): string {
+  const progress = operation.progress
+  return [
+    operation.status,
+    String(progress?.percent ?? ''),
+    String(progress?.done ?? ''),
+    String(progress?.detail ?? ''),
+  ].join('|')
+}
+
+/** 一直没推进时留在行里的话：等会话结束和真在跑要分开说，别让人以为装了一半。 */
+function stalledReason(operation: PluginOperation): string {
+  const agents = operation.wait?.activeAgentIds.length ?? 0
+  if (operation.status === 'queued' || agents > 0) {
+    return agents > 0
+      ? '还没开始升级：等 ' + String(agents) + ' 个运行中的会话结束后再点'
+      : '还没开始升级：一直在排队，稍后再点'
+  }
+  return '升级还在后台跑，先不等了：稍后打开面板看结果'
+}
+
 /** 运行中：状态写 pnpm 给的那一句，进度条按真实百分比走。 */
 function paintPluginRunning(row: PluginRowView, operation: PluginOperation): void {
   const progress = operation.progress
@@ -1218,11 +1275,11 @@ function paintPluginRunning(row: PluginRowView, operation: PluginOperation): voi
   const percent = progress?.percent ?? null
   const text =
     detail !== null
-      ? detail
+      ? compactReason(detail)
       : percent !== null
         ? '正在升级…' + String(percent) + '%'
         : '正在升级…'
-  setRowState(row, text)
+  setRowState(row, text, false, detail ?? undefined)
   setRowProgress(row, percent, true)
 }
 
@@ -1240,7 +1297,12 @@ function handlePluginStartFailure(
     setRowProgress(row, null, false)
     return
   }
-  setRowState(row, message !== undefined && message !== '' ? '升级失败：' + message : '升级失败', true)
+  setRowState(
+    row,
+    message !== undefined && message !== '' ? '升级失败：' + compactReason(message) : '升级失败',
+    true,
+    message,
+  )
   setRowProgress(row, null, false)
 }
 
@@ -1257,8 +1319,11 @@ function handlePluginOperation(row: PluginRowView, operation: PluginOperation): 
       }
       setRowState(
         row,
-        operation.message !== undefined && operation.message !== '' ? '升级失败：' + operation.message : '升级失败',
+        operation.message !== undefined && operation.message !== ''
+          ? '升级失败：' + compactReason(operation.message)
+          : '升级失败',
         true,
+        operation.message,
       )
       return
     case 'cancelled':
@@ -1268,9 +1333,10 @@ function handlePluginOperation(row: PluginRowView, operation: PluginOperation): 
       setRowState(
         row,
         operation.message !== undefined && operation.message !== ''
-          ? '升级失败，已回滚：' + operation.message
+          ? '升级失败，已回滚：' + compactReason(operation.message)
           : '升级失败，已回滚',
         true,
+        operation.message,
       )
       return
     default:

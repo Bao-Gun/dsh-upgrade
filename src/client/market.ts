@@ -154,6 +154,11 @@ function normalizeProgress(value: unknown): PluginProgress | undefined {
     done: numberOrNull(value.done),
     total: numberOrNull(value.total),
   }
+  // 宿主通常直接给 percent；只给 done/total 时自己折算，别把「装了 3/4」当成没有进度
+  // ——否则面板既画不出条，也分不清是在动还是卡住。
+  if (wait.percent === null && wait.done !== null && wait.total !== null && wait.total > 0) {
+    wait.percent = Math.round((wait.done / wait.total) * 100)
+  }
   if (wait.percent === null && wait.phase === null && wait.detail === null) return undefined
   if (wait.percent !== null) {
     const clamped = Math.min(100, Math.max(0, Math.round(wait.percent)))
