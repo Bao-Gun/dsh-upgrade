@@ -11,7 +11,7 @@
  */
 import { spawn, spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -35,6 +35,23 @@ export class InstallError extends Error {
 
 function sleep(ms) {
   return new Promise((done) => setTimeout(done, ms))
+}
+
+/** 启动 URL 与实例日志里都可能带 ?token=…；打印前统一打码。 */
+function maskToken(text) {
+  return String(text).replace(/([?&]token=)[^\s&#]+/g, '$1***')
+}
+
+/** 同目录写 .tmp 再 rename：Ctrl-C / 崩溃时原文件保持完整，不会留下半截 JSON/YAML。 */
+async function writeFileAtomic(path, text) {
+  const tempPath = `${path}.tmp`
+  try {
+    await writeFile(tempPath, text)
+    await rename(tempPath, path)
+  } catch (error) {
+    await rm(tempPath, { force: true }).catch(() => {})
+    throw error
+  }
 }
 
 async function readTextFile(path, label) {
@@ -324,7 +341,7 @@ export async function applyPlan(plan) {
   }
   const table = []
   const applied = []
-  const run = async (label, skip, fn) => {
+  const run = async (label, skip, fn, hint) => {
     if (skip) {
       table.push(`- ${label}: 已一致，跳过`)
       return
@@ -341,26 +358,37 @@ export async function applyPlan(plan) {
         '步骤:',
         ...table.map((row) => `  ${row}`),
         `已完成: ${applied.length ? applied.join('；') : '无'}`,
+        ...(hint ? [`写入方式: ${hint}`] : []),
         '重跑本脚本即可自愈（幂等：已完成的步骤会跳过或覆盖为一致状态）。',
       ]
       throw new InstallError(message.join('\n'))
     }
   }
 
-  await run('package.json 依赖', plan.dependency.kind === 'skip', async () => {
-    await writeFile(plan.profilePackagePath, plan.dependency.nextText)
-    return `${plan.dependency.kind} ${PLUGIN_NAME}`
-  })
+  await run(
+    'package.json 依赖',
+    plan.dependency.kind === 'skip',
+    async () => {
+      await writeFileAtomic(plan.profilePackagePath, plan.dependency.nextText)
+      return `${plan.dependency.kind} ${PLUGIN_NAME}`
+    },
+    `先写 ${plan.profilePackagePath}.tmp 再 rename；失败时原文件不变，残留的 .tmp 可直接删`,
+  )
   await run(`node_modules/${PLUGIN_NAME} 软链`, plan.pluginLink.kind !== 'install', async () => {
     await mkdir(dirname(plan.pluginLink.path), { recursive: true })
     await rm(plan.pluginLink.path, { force: true })
     await symlink(plan.repoDir, plan.pluginLink.path, 'dir')
     return `-> ${plan.repoDir}`
   })
-  await run('cordis.patch.yml', !plan.patch.changed, async () => {
-    await writeFile(plan.patchPath, plan.patch.text)
-    return '追加 insert 块'
-  })
+  await run(
+    'cordis.patch.yml',
+    !plan.patch.changed,
+    async () => {
+      await writeFileAtomic(plan.patchPath, plan.patch.text)
+      return '追加 insert 块'
+    },
+    `先写 ${plan.patchPath}.tmp 再 rename；失败时原文件不变，残留的 .tmp 可直接删`,
+  )
   return { changed: applied.length > 0, applied, steps: table }
 }
 
@@ -576,7 +604,7 @@ export async function runVerify({
     if (!child.pid) throw new InstallError(`无法启动 dsh（${dshBin}）：检查 DSH_BIN 或 PATH`)
 
     const url = await waitForLaunchUrl(() => logBuffer, child, timeoutMs)
-    record('spawn', true, url.replace(/\?.*$/, '?token=***'))
+    record('spawn', true, maskToken(url))
 
     const origin = new URL(url).origin
     const cookie = await bootstrapCookie(url)
@@ -589,6 +617,8 @@ export async function runVerify({
     result = { ok: false, error: error instanceof Error ? error.message : String(error) }
     steps.push({ name: 'error', ok: false, detail: result.error })
   } finally {
+    let killOk = true
+    let cleanupOk = true
     if (child && child.pid) {
       try {
         process.kill(-child.pid, 'SIGTERM')
@@ -596,24 +626,46 @@ export async function runVerify({
         // 进程可能已经自己退出。
       }
       const exited = await waitForExit(child, 5000)
+      let reclaimed = exited
       if (!exited) {
         try {
           process.kill(-child.pid, 'SIGKILL')
         } catch {
           // 同上。
         }
-        await waitForExit(child, 2000)
+        reclaimed = await waitForExit(child, 2000)
       }
-      record('kill', true, `进程组 ${child.pid} 已回收（SIGTERM${exited ? '' : '→SIGKILL'}）`)
+      killOk = reclaimed
+      record(
+        'kill',
+        reclaimed,
+        reclaimed
+          ? `进程组 ${child.pid} 已回收（SIGTERM${exited ? '' : '→SIGKILL'}）`
+          : `进程组 ${child.pid} 在 SIGTERM/SIGKILL 后仍未退出`,
+      )
     }
     if (home) {
-      await rm(home, { recursive: true, force: true }).catch(() => {})
+      try {
+        await rm(home, { recursive: true, force: true })
+      } catch {
+        // 删除失败交给下面的实际存在性检查判定。
+      }
       const cleaned = !existsSync(home)
+      cleanupOk = cleaned
       record('cleanup', cleaned, `临时目录已删除: ${cleaned}（${home}）`)
+    }
+    if (!killOk || !cleanupOk) {
+      const residue = []
+      if (!killOk) residue.push(`进程组 ${child?.pid ?? '?'} 未被回收`)
+      if (!cleanupOk) residue.push(`临时目录未删除: ${home}`)
+      result = {
+        ok: false,
+        error: [result.ok ? null : result.error, ...residue].filter(Boolean).join('；'),
+      }
     }
   }
 
-  return { ...result, elapsedMs: Date.now() - started, steps, logTail: logBuffer.slice(-3000) }
+  return { ...result, elapsedMs: Date.now() - started, steps, logTail: maskToken(logBuffer.slice(-3000)) }
 }
 
 function parseArgs(argv) {
@@ -651,6 +703,7 @@ const HELP = `用法: node scripts/install.mjs [--profile <dir>] [--repo <dir>] 
 
 前置条件: 先在仓库里跑 npm run build，让 lib/index.js 与 lib/client.js 存在。
 安装完成后需重启 dsh web（或用 dsh_restart 工具）才会加载插件。
+有阻塞项（node_modules/dsh-upgrade 是真实目录/文件）时，无论哪种模式都以退出码 1 结束，便于脚本化预检。
 `
 
 export async function main(argv = process.argv.slice(2), io = { out: console.log, err: console.error }) {
@@ -668,6 +721,12 @@ export async function main(argv = process.argv.slice(2), io = { out: console.log
 
   const plan = await buildPlan({ repoDir: options.repoDir, profileDir: options.profileDir })
   io.out(formatPlan(plan, options.apply ? 'apply' : options.verify ? 'verify' : 'dry-run'))
+
+  if (plan.pluginLink.kind === 'blocked') {
+    const kind = plan.pluginLink.reason === 'real-directory' ? '真实目录' : '真实文件'
+    io.err(`存在阻塞项：node_modules/${PLUGIN_NAME} 是${kind}，脚本不会覆盖；未写任何文件。`)
+    return 1
+  }
 
   if (!plan.validation.ok) {
     io.err('仓库校验未通过，停止。')

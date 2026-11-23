@@ -30,7 +30,7 @@
 
 ### 服务端 → 本机安装目录
 
-`routes` → `survey`（经 `host` + `versions`）算目标版本；确认升级后抢单飞锁 → `upgrade.runUpgrade` → `state` 把结果写进 `~/.dsh/dsh-upgrade/`；安装动作落在 `/opt/homebrew/lib/node_modules/@deepseek-ai/dsh`，失败按 removeDir → moveDir 回滚。
+`routes` → `survey`（经 `host` + `versions`）算目标版本；确认升级后抢单飞锁 → `upgrade.runUpgrade` → `state` 把结果写进 `~/.dsh/dsh-upgrade/`；安装动作落在宿主发现的全局 dsh 目录（本机为 `/opt/homebrew/lib/node_modules/@deepseek-ai/dsh`，由 `host` 向上找，不写死），失败按 removeDir → moveDir 回滚。
 
 ### 服务端 → registry / GitHub
 
