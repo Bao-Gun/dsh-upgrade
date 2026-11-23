@@ -92,6 +92,12 @@ describe('satisfiesNodeRange', () => {
     expect(satisfiesNodeRange('=22.0.0', '22.0.0')).toBe(true)
     expect(satisfiesNodeRange('=22.0.0', '22.0.1')).toBe(false)
   })
+  test('闭区间 <=（精确版本与部分版本）', () => {
+    expect(satisfiesNodeRange('<=22.0.0', '22.0.0')).toBe(true)
+    expect(satisfiesNodeRange('<=22.0.0', '22.0.1')).toBe(false)
+    expect(satisfiesNodeRange('<=18', '18.9.9')).toBe(true)
+    expect(satisfiesNodeRange('<=18', '19.0.0')).toBe(false)
+  })
   test('x/X/* 通配符', () => {
     expect(satisfiesNodeRange('18.x', '26.7.0')).toBe(false)
     expect(satisfiesNodeRange('18.x', '18.5.0')).toBe(true)
