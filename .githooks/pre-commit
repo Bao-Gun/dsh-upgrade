@@ -6,7 +6,8 @@ srcs=$(printf '%s\n' "$changed" | grep -E '^(src|app|lib)/.*\.(py|ts|tsx|js|go|r
 [ -z "$srcs" ] && exit 0
 fail=0
 for f in $srcs; do
-  refs=$(grep -rlF --include='*.md' "${f}" docs specs 2>/dev/null || true)
+  # docs/superpowers/ 是历史原件，写完不再改，不能因为源文件变了就拦提交
+  refs=$(grep -rlF --include='*.md' "${f}" docs specs 2>/dev/null | grep -v '^docs/superpowers/' || true)
   for d in $refs; do
     if ! printf '%s\n' "$changed" | grep -qx "${d}"; then
       echo "[doc-drift] ${d} 引用了 ${f} - 但这次没一起改" >&2

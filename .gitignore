@@ -10,3 +10,9 @@ build/
 
 # agent 的草稿、计划、临时分析，不进 git
 .work/
+
+# superpowers 的临时 mockup（.superpowers/sdd/ 会自己忽略）
+.superpowers/brainstorm/
+
+# 并行开发的工作树（using-git-worktrees 要求它必须已忽略）
+.worktrees/
