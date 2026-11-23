@@ -196,6 +196,8 @@ type View = {
   upgradeAllButton: HTMLButtonElement
   /** Task 4 接线；这里只把位置占好，平时藏着。 */
   restartButton: HTMLButtonElement
+  /** 第一次点「重启 DSH」只进入确认态，第二次才真的预检并重启。 */
+  restartArmed: boolean
   pluginSummary: HTMLElement
   progress: HTMLElement
   notice: HTMLElement
@@ -540,6 +542,7 @@ function buildView(doc: Document, options: PanelOptions): View {
     rows: new Map<string, PluginRowView>(),
     upgradeAllButton,
     restartButton,
+    restartArmed: false,
     pluginSummary,
     progress,
     notice,
@@ -570,6 +573,29 @@ function buildView(doc: Document, options: PanelOptions): View {
   })
   upgradeAllButton.addEventListener('click', () => {
     void startBatch(view)
+  })
+  restartButton.addEventListener('click', () => {
+    // 重启会直接掐断正在跑的会话：第一下只把危险摆到明面上，第二下才发请求。
+    if (view.batchBusy || view.upgradeBusy || restartButton.disabled) return
+    if (!view.restartArmed) {
+      view.restartArmed = true
+      restartButton.textContent = '确认重启？'
+      setNotice(view, '重启会中断当前会话；再点一次「确认重启？」继续')
+      return
+    }
+    view.restartArmed = false
+    restartButton.textContent = '重启中…'
+    restartButton.disabled = true
+    // 插件批量没有本体升级的阶段条；清掉上一轮残留，让预检从干净的面板开始。
+    view.progress.textContent = ''
+    view.progress.hidden = true
+    const token = view.token
+    void runRestartChain(view, token, (reason) => {
+      if (!live(view, token)) return
+      restartButton.disabled = false
+      restartButton.textContent = '重启 DSH'
+      setNotice(view, '重启不可用：' + reason)
+    })
   })
   prerelease.addEventListener('change', () => {
     // 升级进行中重查会用旧 survey 重画，按钮忽隐忽现且点击无效果；直接按住。
@@ -1071,6 +1097,11 @@ async function startBatch(view: View): Promise<void> {
   setBatchBusy(view, true)
   view.pluginSummary.hidden = true
   view.pluginSummary.textContent = ''
+  // 上一轮露出来的重启入口先收回去；这一轮跑完再按 dsh-restart 的可用性决定。
+  view.restartButton.hidden = true
+  view.restartButton.disabled = false
+  view.restartButton.textContent = '重启 DSH'
+  view.restartArmed = false
 
   let summary: BatchSummary
   try {
@@ -1098,6 +1129,7 @@ async function startBatch(view: View): Promise<void> {
     const row = view.rows.get(name)
     if (row !== undefined) paintSkipped(row)
   }
+  if (summary.succeeded.length > 0) await offerRestart(view, token)
 }
 
 /** 汇总行：空文案就收起，不占一条空缝。 */
@@ -1288,12 +1320,36 @@ async function consumeUpgrade(view: View, token: number, response: Response, tar
   await continueToRestart(view, token, target)
 }
 
-async function continueToRestart(view: View, token: number, target: string): Promise<void> {
+/** 预检失败事件里能给人看的原因：阶段名 + 第一条失败说明。 */
+function restartFailureDetail(event: Record<string, unknown>): string {
+  const stage = asString(event.stage)
+  const label = stage === '' ? '' : (RESTART_STAGE_LABELS[stage] ?? stage)
+  let message = ''
+  if (Array.isArray(event.failures)) {
+    for (const failure of event.failures) {
+      if (!isRecord(failure)) continue
+      message = compactReason(asString(failure.message))
+      if (message !== '') break
+    }
+  }
+  if (message === '') message = compactReason(asString(event.message))
+  if (message === '') return label
+  return label === '' ? message : label + '：' + message
+}
+
+/**
+ * status → precheck → restart 三步固定顺序；任何一步走不通就交给 onManual 说一句人话，
+ * 预检没过时绝不发 restart。成功时按调用方给的文案提示。
+ */
+async function runRestartChain(
+  view: View,
+  token: number,
+  onManual: (reason: string) => void,
+  successText = '正在重启…',
+): Promise<void> {
   const f = fetchOf(view.doc)
   const base = view.options.apiBase ?? ''
-  const manualRestart = (reason: string): void => {
-    setNotice(view, '已升级到 ' + target + '，' + reason + '，需手动重启')
-  }
+  setNotice(view, '正在预检…')
 
   let status: Response
   try {
@@ -1303,13 +1359,13 @@ async function continueToRestart(view: View, token: number, target: string): Pro
       headers: { ...RESTART_HEADERS },
     })
   } catch {
-    if (live(view, token)) manualRestart('没找到 dsh-restart')
+    if (live(view, token)) onManual('没找到 dsh-restart')
     return
   }
   if (!live(view, token)) return
   if (!status.ok) {
     // 只有 404 才意味着插件不在；403/500 是「在，但拒绝/坏了」，不能误导人去装。
-    manualRestart(
+    onManual(
       status.status === 404
         ? '没找到 dsh-restart'
         : status.status === 401 || status.status === 403
@@ -1327,21 +1383,35 @@ async function continueToRestart(view: View, token: number, target: string): Pro
       headers: { ...RESTART_HEADERS },
     })
   } catch {
-    if (live(view, token)) manualRestart('预检请求发不出去')
+    if (live(view, token)) onManual('预检请求发不出去')
     return
   }
   if (!live(view, token)) return
   if (!precheck.ok) {
-    manualRestart('预检失败（HTTP ' + precheck.status + '）')
+    const body = await readJsonBody(precheck)
+    if (!live(view, token)) return
+    const message = isRecord(body) ? compactReason(asString(body.message)) : ''
+    onManual('预检失败（HTTP ' + precheck.status + (message === '' ? '' : '：' + message) + '）')
     return
   }
 
   let passed = true
+  let detail = ''
   try {
     await readNdjson(precheck, (event) => {
       if (!live(view, token)) return
-      if (event.ok === false) passed = false
-      if (event.error !== undefined && event.error !== null) passed = false
+      if (event.ok === false) {
+        passed = false
+        if (detail === '') detail = restartFailureDetail(event)
+      }
+      if (event.error !== undefined && event.error !== null) {
+        passed = false
+        if (detail === '') {
+          detail = compactReason(
+            isRecord(event.error) ? asString(event.error.message) : asString(event.error),
+          )
+        }
+      }
       const stage = asString(event.stage)
       if (stage !== '') {
         // 预检会克隆 profile 再起一个冒烟实例，几十秒没反馈像是卡死；把阶段推进度条。
@@ -1357,12 +1427,13 @@ async function continueToRestart(view: View, token: number, target: string): Pro
       if (event.done === true && event.ok !== false && passed) addProgress(view, '重启预检完成')
     })
   } catch {
-    if (live(view, token)) manualRestart('预检读到一半断了')
+    if (live(view, token)) onManual('预检读到一半断了')
     return
   }
   if (!live(view, token)) return
   if (!passed) {
-    manualRestart('预检没通过')
+    // 原因常驻面板，别让用户只看到一闪而过的红条就去猜哪里坏了。
+    onManual('预检没通过' + (detail === '' ? '' : '：' + detail))
     return
   }
 
@@ -1374,7 +1445,7 @@ async function continueToRestart(view: View, token: number, target: string): Pro
       headers: { ...RESTART_HEADERS },
     })
   } catch {
-    if (live(view, token)) manualRestart('重启请求发不出去')
+    if (live(view, token)) onManual('重启请求发不出去')
     return
   }
   if (!live(view, token)) return
@@ -1383,10 +1454,56 @@ async function continueToRestart(view: View, token: number, target: string): Pro
     return
   }
   if (!restart.ok) {
-    manualRestart('重启请求失败（HTTP ' + restart.status + '）')
+    onManual('重启请求失败（HTTP ' + restart.status + '）')
     return
   }
-  setNotice(view, '已升级到 ' + target + '，正在重启…')
+  setNotice(view, successText)
+}
+
+async function continueToRestart(view: View, token: number, target: string): Promise<void> {
+  await runRestartChain(
+    view,
+    token,
+    (reason) => {
+      setNotice(view, '已升级到 ' + target + '，' + reason + '，需手动重启')
+    },
+    '已升级到 ' + target + '，正在重启…',
+  )
+}
+
+/** 批量升级收工后按 dsh-restart 的可用性决定露不露重启入口。 */
+async function offerRestart(view: View, token: number): Promise<void> {
+  view.restartButton.hidden = true
+  view.restartButton.disabled = false
+  view.restartButton.textContent = '重启 DSH'
+  view.restartArmed = false
+
+  const f = fetchOf(view.doc)
+  const base = view.options.apiBase ?? ''
+  let status: Response
+  try {
+    status = await f(joinUrl(base, RESTART_STATUS_PATH), {
+      method: 'GET',
+      credentials: 'same-origin',
+      headers: { ...RESTART_HEADERS },
+    })
+  } catch {
+    // 查询期间用户可能又开了一轮批量：这时的旧答案不能把按钮塞回面板。
+    if (!live(view, token) || view.batchBusy) return
+    setNotice(view, '插件已升级，需手动重启 dsh web 才生效')
+    return
+  }
+  if (!live(view, token) || view.batchBusy) return
+  if (status.status === 200) {
+    view.restartButton.hidden = false
+    setNotice(view, '插件已升级，可点「重启 DSH」让改动生效')
+    return
+  }
+  if (status.status === 404) {
+    setNotice(view, '插件已升级，需手动重启 dsh web 才生效')
+    return
+  }
+  setNotice(view, '插件已升级，但重启不可用（HTTP ' + status.status + '），需手动重启 dsh web')
 }
 
 /**
