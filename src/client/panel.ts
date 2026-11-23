@@ -12,14 +12,13 @@
  */
 
 import {
-  fetchPluginUpdates,
-  isPluginUnavailableCode,
-  pollPluginOperation,
-  startPluginUpdate,
-  type PluginOperation,
-  type PluginUpdate,
-  type PluginUpdates,
-} from './market'
+  DEFAULT_POLL_INTERVAL_MS,
+  DEFAULT_STALLED_WAIT_MS,
+  runBatch,
+  type BatchItem,
+  type BatchSummary,
+} from './batch'
+import { fetchPluginUpdates, type PluginUpdate, type PluginUpdates } from './market'
 
 export type PanelState = {
   hasUpdate: boolean
@@ -54,6 +53,8 @@ const UPGRADE_PATH = '/dsh-upgrade/api/upgrade'
 const RESTART_STATUS_PATH = '/dsh-restart/api/status'
 const RESTART_PRECHECK_PATH = '/dsh-restart/api/precheck'
 const RESTART_PATH = '/dsh-restart/api/restart'
+/** 确认态冷却：误双击的第二下必须落在 800ms 之外，才算第二次意图。 */
+const CONFIRM_COOLDOWN_MS = 800
 
 const HOST_HEADERS: Record<string, string> = { 'x-dsh-upgrade': '1' }
 const RESTART_HEADERS: Record<string, string> = { 'x-dsh-restart': '1' }
@@ -66,11 +67,6 @@ const RESTART_STAGE_LABELS: Record<string, string> = {
 }
 
 const RELEASE_PAGE = 'https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v'
-const DEFAULT_POLL_INTERVAL_MS = 800
-/** 一轮升级最多盯这么久（约 20 分钟），防止流断在半路时无限轮询。 */
-const MAX_POLLS = 1500
-/** 默认 3 分钟没推进就解锁：pnpm 会不停报进度，真卡住的多半是在等会话结束。 */
-const DEFAULT_STALLED_WAIT_MS = 180_000
 
 const PHASE_LABELS: Record<string, string> = {
   backup: '备份',
@@ -108,9 +104,9 @@ const STYLE_TEXT = [
   '.dshu-row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}',
   '.dshu-toggle{display:inline-flex;align-items:center;gap:6px;color:var(--dsw-alias-label-secondary,inherit);cursor:pointer}',
   '.dshu-toggle input{accent-color:var(--dsw-alias-state-business-primary,#4d6bfe)}',
-  '.dshu-refresh,.dshu-upgrade-btn,.dshu-plugin-upgrade,.dshu-release-toggle{padding:6px 12px;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.12));border-radius:var(--dsw-radius-sm,6px);background:transparent;color:inherit;font:inherit;cursor:pointer}',
+  '.dshu-refresh,.dshu-upgrade-btn,.dshu-release-toggle{padding:6px 12px;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.12));border-radius:var(--dsw-radius-sm,6px);background:transparent;color:inherit;font:inherit;cursor:pointer}',
   '.dshu-upgrade-btn{background:var(--dsw-alias-state-business-primary,#4d6bfe);border-color:transparent;color:#fff;font-weight:600}',
-  '.dshu-upgrade-btn:disabled,.dshu-plugin-upgrade:disabled{opacity:.55;cursor:not-allowed}',
+  '.dshu-upgrade-btn:disabled{opacity:.55;cursor:not-allowed}',
   '.dshu-upgrade-btn[data-blocked]{background:transparent;border-color:var(--dsw-alias-border-l2,rgba(0,0,0,.12));color:var(--dsw-alias-label-secondary,inherit);font-weight:400}',
   '.dshu-release{display:flex;flex-direction:column;gap:8px}',
   '.dshu-release[hidden]{display:none}',
@@ -122,15 +118,25 @@ const STYLE_TEXT = [
   '.dshu-release-link{color:var(--dsw-alias-state-business-primary,#4d6bfe);text-decoration:none;font-size:13px}',
   '.dshu-release-hint{display:flex;gap:8px;align-items:center;color:var(--dsw-alias-label-secondary,inherit)}',
   '.dshu-plugin-list{display:flex;flex-direction:column;gap:8px}',
-  '.dshu-plugin{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 10px;padding:10px;border-radius:var(--dsw-radius-sm,6px);background:var(--dsw-alias-bg-layer-2,rgba(0,0,0,.03))}',
+  '.dshu-plugins-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0}',
+  '.dshu-plugins-head h3{margin:0}',
+  '.dshu-plugins-head .dshu-upgrade-all{margin-left:auto}',
+  '.dshu-upgrade-all,.dshu-restart{padding:4px 10px;font-size:12px;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.12));border-radius:var(--dsw-radius-sm,6px);background:transparent;color:inherit;font-family:inherit;cursor:pointer}',
+  '.dshu-upgrade-all:disabled,.dshu-restart:disabled{opacity:.5;cursor:default}',
+  '.dshu-plugin-summary{font-size:12px;color:var(--dsw-alias-label-tertiary,inherit)}',
+  '.dshu-plugin-summary[hidden]{display:none}',
+  '.dshu-plugin{display:flex;flex-direction:column;gap:4px;padding:10px;border-radius:var(--dsw-radius-sm,6px);background:var(--dsw-alias-bg-layer-2,rgba(0,0,0,.03))}',
+  '.dshu-plugin-line{display:flex;justify-content:space-between;gap:10px;align-items:baseline}',
   '.dshu-plugin-name{font-weight:600;overflow:hidden;text-overflow:ellipsis}',
   '.dshu-plugin-version{color:var(--dsw-alias-label-secondary,inherit);font-variant-numeric:tabular-nums}',
-  '.dshu-plugin-state{grid-column:1/2;font-size:12px;color:var(--dsw-alias-label-tertiary,inherit)}',
-  '.dshu-plugin-upgrade{grid-row:1/3;grid-column:2/3;align-self:center}',
+  '.dshu-plugin-state{font-size:12px;color:var(--dsw-alias-label-tertiary,inherit)}',
+  '.dshu-plugin-progress{display:flex;flex-direction:column;gap:4px}',
+  '.dshu-plugin-progress[hidden]{display:none}',
+  '.dshu-plugin-progress-text{font-size:12px;color:var(--dsw-alias-label-tertiary,inherit)}',
   '.dshu-plugin-empty,.dshu-plugin-unavailable{color:var(--dsw-alias-label-secondary,inherit)}',
   '.dshu-plugin-state[data-error]{color:var(--dsw-alias-state-error-primary,#e5484d)}',
   // 进度条：有百分比就定宽，没有就左右来回跑（pnpm 还没给总量）。
-  '.dshu-bar{grid-column:1/3;height:4px;border-radius:2px;background:var(--dsw-alias-border-l2,rgba(0,0,0,.1));overflow:hidden}',
+  '.dshu-bar{height:4px;border-radius:2px;background:var(--dsw-alias-border-l2,rgba(0,0,0,.1));overflow:hidden}',
   '.dshu-bar[hidden]{display:none}',
   '.dshu-bar-fill{height:100%;width:0;background:var(--dsw-alias-state-business-primary,#4d6bfe);transition:width .25s ease}',
   '.dshu-bar[data-indeterminate] .dshu-bar-fill{width:38%;animation:dshu-slide 1.1s ease-in-out infinite}',
@@ -187,6 +193,18 @@ type View = {
   hostFill: HTMLElement
   pluginHead: HTMLElement
   pluginList: HTMLElement
+  /** 批量事件按名字找回自己那一行；重画列表时整张表重建。 */
+  rows: Map<string, PluginRowView>
+  upgradeAllButton: HTMLButtonElement
+  /** Task 4 接线；这里只把位置占好，平时藏着。 */
+  restartButton: HTMLButtonElement
+  /** 第一次点「重启 DSH」只进入确认态，第二次才真的预检并重启。 */
+  restartArmed: boolean
+  /** 进入确认态的时刻；冷却期内点击一律忽略，防误双击直接重启。 */
+  restartArmedAt: number | null
+  /** 一条重启链在跑时挡住后续点击，避免连点叠出第二条链。 */
+  restartRunning: boolean
+  pluginSummary: HTMLElement
   progress: HTMLElement
   notice: HTMLElement
   prerelease: HTMLInputElement
@@ -197,6 +215,7 @@ type View = {
   plugins: PluginUpdates | null
   includePrerelease: boolean
   upgradeBusy: boolean
+  batchBusy: boolean
   token: number
   closed: boolean
   previousOverflow: string
@@ -361,12 +380,6 @@ function failureTextOf(event: Record<string, unknown>): string {
   return message !== '' ? message : '升级失败'
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms)
-  })
-}
-
 async function readJsonBody(response: Response): Promise<unknown> {
   try {
     return await response.json()
@@ -492,10 +505,19 @@ function buildView(doc: Document, options: PanelOptions): View {
 
   const pluginsSection = element(doc, 'section', 'dshu-section')
   pluginsSection.setAttribute('data-k', 'plugins')
+  // 标题与动作同一行：左边「插件（N 个可更新）」，右边「全部升级」；重启按钮 Task 4 才露头。
+  const pluginsHead = element(doc, 'div', 'dshu-plugins-head')
   const pluginHead = doc.createElement('h3')
+  pluginHead.className = 'dshu-plugin-head'
   pluginHead.textContent = '插件'
+  const upgradeAllButton = buttonOf(doc, 'dshu-upgrade-all', '全部升级')
+  const restartButton = buttonOf(doc, 'dshu-restart', '重启 DSH')
+  restartButton.hidden = true
+  pluginsHead.append(pluginHead, upgradeAllButton, restartButton)
   const pluginList = element(doc, 'div', 'dshu-plugin-list')
-  pluginsSection.append(pluginHead, pluginList)
+  const pluginSummary = element(doc, 'div', 'dshu-plugin-summary')
+  pluginSummary.hidden = true
+  pluginsSection.append(pluginsHead, pluginList, pluginSummary)
 
   const progress = element(doc, 'div', 'dshu-progress')
   progress.hidden = true
@@ -523,6 +545,13 @@ function buildView(doc: Document, options: PanelOptions): View {
     hostFill,
     pluginHead,
     pluginList,
+    rows: new Map<string, PluginRowView>(),
+    upgradeAllButton,
+    restartButton,
+    restartArmed: false,
+    restartArmedAt: null,
+    restartRunning: false,
+    pluginSummary,
     progress,
     notice,
     prerelease,
@@ -533,6 +562,7 @@ function buildView(doc: Document, options: PanelOptions): View {
     plugins: null,
     includePrerelease: false,
     upgradeBusy: false,
+    batchBusy: false,
     token: 1,
     closed: false,
     previousOverflow: '',
@@ -549,15 +579,51 @@ function buildView(doc: Document, options: PanelOptions): View {
   overlay.addEventListener('click', (event) => {
     if (event.target === overlay) close(view)
   })
+  upgradeAllButton.addEventListener('click', () => {
+    void startBatch(view)
+  })
+  restartButton.addEventListener('click', () => {
+    // 重启会直接掐断正在跑的会话：第一下只把危险摆到明面上，第二下才发请求。
+    if (view.batchBusy || view.upgradeBusy || view.restartRunning || restartButton.disabled) return
+    // 冷却期内（含同 tick 的误双击）什么都不做，避免第二下立即重启。
+    if (view.restartArmedAt !== null && Date.now() - view.restartArmedAt < CONFIRM_COOLDOWN_MS) return
+    if (!view.restartArmed) {
+      view.restartArmed = true
+      view.restartArmedAt = Date.now()
+      restartButton.textContent = '确认重启？'
+      setNotice(view, '重启会中断当前会话；再点一次「确认重启？」继续')
+      return
+    }
+    view.restartArmed = false
+    view.restartArmedAt = null
+    // 同步连点也在这一刻被挡住：一次确认只允许启动一条链。
+    view.restartRunning = true
+    setRestartBusy(view, true)
+    restartButton.textContent = '重启中…'
+    restartButton.disabled = true
+    // 插件批量没有本体升级的阶段条；清掉上一轮残留，让预检从干净的面板开始。
+    view.progress.textContent = ''
+    view.progress.hidden = true
+    const token = view.token
+    void runRestartChain(view, token, (reason) => {
+      if (!live(view, token)) return
+      setRestartBusy(view, false)
+      restartButton.disabled = false
+      restartButton.textContent = '重启 DSH'
+      setNotice(view, '重启不可用：' + reason)
+    })
+  })
   prerelease.addEventListener('change', () => {
     // 升级进行中重查会用旧 survey 重画，按钮忽隐忽现且点击无效果；直接按住。
-    if (view.upgradeBusy) return
+    if (view.upgradeBusy || view.batchBusy) return
+    disarmRestart(view)
     const token = view.token
     view.includePrerelease = prerelease.checked
     void loadHost(view, token, { check: true, force: false })
   })
   refreshButton.addEventListener('click', () => {
-    if (view.upgradeBusy) return
+    if (view.upgradeBusy || view.batchBusy) return
+    disarmRestart(view)
     const token = view.token
     view.includePrerelease = prerelease.checked
     void loadHost(view, token, { check: true, force: true })
@@ -608,7 +674,7 @@ function emitState(view: View): void {
   const pluginUpdate =
     view.plugins !== null && view.plugins.available && view.plugins.updatable.length > 0
   try {
-    view.options.onState?.({ hasUpdate: hostUpdate || pluginUpdate, busy: view.upgradeBusy })
+    view.options.onState?.({ hasUpdate: hostUpdate || pluginUpdate, busy: view.upgradeBusy || view.batchBusy })
   } catch {
     // 角标刷新失败不影响面板本身。
   }
@@ -638,6 +704,14 @@ function setNotice(view: View, text: string): void {
   }
   view.notice.hidden = false
   view.notice.textContent = text
+}
+
+/** 面板重查或开始本体升级时，没确认完的重启意图作废，免得更晚一次点击直接重启。 */
+function disarmRestart(view: View): void {
+  view.restartArmedAt = null
+  if (!view.restartArmed) return
+  view.restartArmed = false
+  view.restartButton.textContent = '重启 DSH'
 }
 
 function resetProgress(view: View): void {
@@ -725,6 +799,9 @@ function renderSurvey(view: View): void {
     upgrade.textContent = survey.blocked.message !== '' ? survey.blocked.message : '需要 Node（本机版本不满足）'
     upgrade.title = survey.blocked.code
   } else {
+    // 状态可能比插件列表晚到：这期间批量已经在跑，按钮必须一开始就是禁用的，
+    // 否则会造出一个点下去毫无反应的入口。
+    upgrade.disabled = view.batchBusy || view.upgradeBusy
     upgrade.addEventListener('click', () => {
       void runHostUpgrade(view, view.token)
     })
@@ -812,60 +889,79 @@ function renderReleases(view: View, reply: ReleasesReply): void {
 function renderPlugins(view: View): void {
   const doc = view.doc
   view.pluginList.textContent = ''
+  view.rows.clear()
+  view.pluginSummary.hidden = true
+  view.pluginSummary.textContent = ''
   const plugins = view.plugins
   if (plugins === null) {
     view.pluginHead.textContent = '插件'
+    view.upgradeAllButton.hidden = true
     return
   }
   if (!plugins.available) {
     view.pluginHead.textContent = '插件'
+    view.upgradeAllButton.hidden = true
     view.pluginList.appendChild(element(doc, 'div', 'dshu-plugin-unavailable', '插件更新不可用'))
     return
   }
   view.pluginHead.textContent =
     plugins.updatable.length > 0 ? '插件（' + plugins.updatable.length + ' 个可更新）' : '插件'
   if (plugins.updatable.length === 0) {
+    view.upgradeAllButton.hidden = true
     view.pluginList.appendChild(element(doc, 'div', 'dshu-plugin-empty', '已是最新'))
     return
   }
+  view.upgradeAllButton.hidden = false
   for (const update of plugins.updatable) {
-    view.pluginList.appendChild(createPluginRow(view, update).root)
+    const row = createPluginRow(view, update)
+    view.rows.set(update.name, row)
+    view.pluginList.appendChild(row.root)
   }
 }
 
 /** 一行插件需要的全部节点：状态与失败原因都写在这一行里，不往面板底部抛。 */
-type PluginRowView = {
+export type PluginRowView = {
   root: HTMLElement
+  name: HTMLElement
+  version: HTMLElement
   state: HTMLElement
   bar: HTMLElement
   fill: HTMLElement
-  button: HTMLButtonElement
+  progress: HTMLElement
+  progressText: HTMLElement
 }
 
+/**
+ * 两行式：第一行名字与版本对，第二行是这一行自己的状态与进度。
+ * 不在行内放升级入口——升级由面板顶部的一个「全部升级」串行驱动。
+ */
 function createPluginRow(view: View, update: PluginUpdate): PluginRowView {
   const doc = view.doc
   const root = element(doc, 'div', 'dshu-plugin')
-  root.setAttribute('data-name', update.name)
+  root.dataset.name = update.name
+  const line = element(doc, 'div', 'dshu-plugin-line')
   const name = element(doc, 'div', 'dshu-plugin-name', update.name)
   const version = element(doc, 'div', 'dshu-plugin-version', update.from + ' → ' + update.to)
+  line.append(name, version)
   const state = element(doc, 'div', 'dshu-plugin-state')
+  const progress = element(doc, 'div', 'dshu-plugin-progress')
+  progress.hidden = true
   const bar = element(doc, 'div', 'dshu-bar')
   bar.hidden = true
   const fill = element(doc, 'div', 'dshu-bar-fill')
   bar.appendChild(fill)
-  const button = buttonOf(doc, 'dshu-plugin-upgrade', '升级')
-  const row: PluginRowView = { root, state, bar, fill, button }
-  button.addEventListener('click', () => {
-    void runPluginUpdate(view, update, row)
-  })
-  root.append(name, version, state, bar, button)
-  return row
+  const progressText = element(doc, 'div', 'dshu-plugin-progress-text')
+  progress.append(bar, progressText)
+  root.append(line, state, progress)
+  return { root, name, version, state, bar, fill, progress, progressText }
 }
 
 /** 行内状态：失败用红字，并且清掉上一轮的进度条。 */
 function setRowState(row: PluginRowView, text: string, isError = false, full?: string): void {
   row.state.textContent = text
   row.state.title = full ?? ''
+  // 没有状态文字时整行收起，免得行与进度块之间留一条空缝。
+  row.state.hidden = text === ''
   if (isError) row.state.setAttribute('data-error', '')
   else row.state.removeAttribute('data-error')
 }
@@ -884,6 +980,7 @@ function compactReason(raw: string, limit = 90): string {
 
 /** percent 为 null 表示 pnpm 还没报总量：画不确定进度（来回跑），不假装 0%。 */
 function setRowProgress(row: PluginRowView, percent: number | null, visible: boolean): void {
+  row.progress.hidden = !visible
   row.bar.hidden = !visible
   if (!visible) {
     row.bar.removeAttribute('data-indeterminate')
@@ -897,6 +994,187 @@ function setRowProgress(row: PluginRowView, percent: number | null, visible: boo
   }
   row.bar.removeAttribute('data-indeterminate')
   row.fill.style.width = String(percent) + '%'
+}
+
+/**
+ * 把一个 BatchItem 画到它自己那一行。
+ *
+ * 这里只做两件事：把 pnpm 的长 output 压成一句、给真失败上红字。
+ * message 与 unavailable 由批量层判定；请求层不可用不是安装失败，不红。
+ */
+export function paintBatchItem(row: PluginRowView, item: BatchItem): void {
+  switch (item.state) {
+    case 'pending':
+      setRowState(row, '')
+      row.progressText.textContent = ''
+      setRowProgress(row, null, false)
+      return
+    case 'running': {
+      const percent = item.percent
+      // 行内文案按批量层给的优先级：排队提示（message）> pnpm 原话（detail）> 百分比。
+      // detail 是 pnpm 的整行输出，压成一句，免得行高忽上忽下。
+      setRowState(row, '')
+      row.progressText.textContent =
+        item.message ??
+        (item.detail !== null
+          ? compactReason(item.detail)
+          : percent !== null
+            ? '正在升级…' + String(percent) + '%'
+            : '正在升级…')
+      setRowProgress(row, percent, true)
+      return
+    }
+    case 'succeeded':
+      setRowState(row, '已升级')
+      row.progressText.textContent = ''
+      setRowProgress(row, null, false)
+      return
+    case 'failed': {
+      row.progressText.textContent = ''
+      setRowProgress(row, null, false)
+      if (item.unavailable) {
+        setRowState(row, item.message ?? '插件更新不可用')
+        return
+      }
+      const message = item.message
+      // 批量层的 message 有纯原因与完整句两种：完整句不再补前缀，但同样压成一句、全文进 title。
+      const stalled =
+        message !== null &&
+        (message.startsWith('还没开始升级') ||
+          message.startsWith('升级还在后台跑') ||
+          message.startsWith('一直在排队'))
+      const complete =
+        message !== null &&
+        (message.startsWith('升级失败') ||
+          message.startsWith('已') ||
+          message === '插件更新不可用' ||
+          stalled)
+      const text =
+        message === null || message === ''
+          ? '升级失败'
+          : complete
+            ? compactReason(message)
+            : '升级失败：' + compactReason(message)
+      // 排队/卡住只是没开始，不是安装失败，不上红字。
+      setRowState(row, text, !stalled, message ?? undefined)
+      return
+    }
+  }
+}
+
+/** R44：batch 对跳过的包不发事件，收尾时按 summary 补一行状态。 */
+function paintSkipped(row: PluginRowView): void {
+  setRowState(row, '已跳过')
+  row.progressText.textContent = ''
+  setRowProgress(row, null, false)
+}
+
+/** R33：一行里把「升成几个、败几个、跳几个」说清；为 0 的那段不写。 */
+function batchSummaryText(summary: BatchSummary): string {
+  const parts: string[] = []
+  if (summary.succeeded.length > 0) parts.push(String(summary.succeeded.length) + ' 个已升级')
+  if (summary.failed.length > 0) parts.push(String(summary.failed.length) + ' 个失败')
+  if (summary.skipped.length > 0) parts.push(String(summary.skipped.length) + ' 个跳过')
+  if (summary.restartRequired && summary.succeeded.length > 0) parts.push('需重启生效')
+  return parts.join('，')
+}
+
+/** 本体按钮该不该禁用：无更新、被阻塞，或任一侧正忙。 */
+function hostUpgradeDisabled(view: View): boolean {
+  return (
+    view.survey === null ||
+    view.survey.blocked !== null ||
+    !hasNewerTarget(view.survey) ||
+    view.batchBusy ||
+    view.upgradeBusy ||
+    view.restartRunning
+  )
+}
+
+/** 批量忙时按住所有会重画或并发起升级的入口；本体忙时反过来按住「全部升级」。 */
+function setBatchBusy(view: View, busy: boolean): void {
+  view.batchBusy = busy
+  view.upgradeAllButton.disabled = busy || view.upgradeBusy || view.restartRunning
+  view.upgradeAllButton.textContent = busy ? '升级中…' : '全部升级'
+  view.prerelease.disabled = busy || view.upgradeBusy || view.restartRunning
+  view.refreshButton.disabled = busy || view.upgradeBusy || view.restartRunning
+  if (view.upgradeButton !== null) {
+    if (busy) {
+      view.upgradeButton.disabled = true
+    } else {
+      view.upgradeButton.disabled = hostUpgradeDisabled(view)
+    }
+  }
+  emitState(view)
+}
+
+/** 重启链在途：按住所有能起新工作的入口；失败收尾时由调用方解除。 */
+function setRestartBusy(view: View, busy: boolean): void {
+  view.restartRunning = busy
+  const blocked = busy || view.batchBusy || view.upgradeBusy
+  view.upgradeAllButton.disabled = blocked
+  view.prerelease.disabled = blocked
+  view.refreshButton.disabled = blocked
+  if (view.upgradeButton !== null) {
+    view.upgradeButton.disabled = busy ? true : hostUpgradeDisabled(view)
+  }
+  emitState(view)
+}
+
+/**
+ * 「全部升级」：先把每行清成 pending（上一轮的结果不能留在屏幕上），再串行跑。
+ * 事件只改对应名字的那一行；面板关了就停手，剩下的包由 runBatch 记成 skipped。
+ */
+async function startBatch(view: View): Promise<void> {
+  if (view.batchBusy || view.upgradeBusy || view.restartRunning) return
+  const plugins = view.plugins
+  if (plugins === null || !plugins.available || plugins.updatable.length === 0) return
+  const names = plugins.updatable.map((update) => update.name)
+  const token = view.token
+  for (const [name, row] of view.rows) {
+    paintBatchItem(row, { name, state: 'pending', percent: null, detail: null, message: null, unavailable: false })
+  }
+  setBatchBusy(view, true)
+  view.pluginSummary.hidden = true
+  view.pluginSummary.textContent = ''
+  // 上一轮露出来的重启入口先收回去；这一轮跑完再按 dsh-restart 的可用性决定。
+  view.restartButton.hidden = true
+  view.restartButton.disabled = false
+  disarmRestart(view)
+
+  let summary: BatchSummary
+  try {
+    summary = await runBatch(names, fetchOf(view.doc), view.options.apiBase ?? '', {
+      pollIntervalMs: view.options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
+      stalledWaitMs: view.options.stalledWaitMs ?? DEFAULT_STALLED_WAIT_MS,
+      cancelled: () => view.closed,
+      onEvent: (event) => {
+        if (!live(view, token)) return
+        const row = view.rows.get(event.item.name)
+        if (row !== undefined) paintBatchItem(row, event.item)
+      },
+    })
+  } catch (error) {
+    // runBatch 的契约是不抛异常；真抛了也不能把红条甩到底栏——失败原因留在汇总行。
+    if (!live(view, token)) return
+    setBatchBusy(view, false)
+    paintSummary(view, '升级中断：' + (error instanceof Error && error.message !== '' ? error.message : '未知原因'))
+    return
+  }
+  if (!live(view, token)) return
+  setBatchBusy(view, false)
+  paintSummary(view, batchSummaryText(summary))
+  for (const name of summary.skipped) {
+    const row = view.rows.get(name)
+    if (row !== undefined) paintSkipped(row)
+  }
+  if (summary.succeeded.length > 0) await offerRestart(view, token)
+}
+
+/** 汇总行：空文案就收起，不占一条空缝。 */
+function paintSummary(view: View, text: string): void {
+  view.pluginSummary.textContent = text
+  view.pluginSummary.hidden = text === ''
 }
 
 async function loadHost(
@@ -957,6 +1235,9 @@ async function loadHost(
 }
 
 async function loadPlugins(view: View, token: number): Promise<void> {
+  // 批次进行中重画列表会让 rows 与 names 快照脱节（点击时的名单已经发出去了），
+  // 这段窗口里不再接受列表刷新。
+  if (view.batchBusy) return
   const base = view.options.apiBase ?? ''
   try {
     const plugins = await fetchPluginUpdates(fetchOf(view.doc), base)
@@ -974,15 +1255,18 @@ async function loadPlugins(view: View, token: number): Promise<void> {
 
 async function runHostUpgrade(view: View, token: number): Promise<void> {
   const survey = view.survey
-  if (survey === null || !hasNewerTarget(survey) || view.upgradeBusy) return
+  if (survey === null || !hasNewerTarget(survey) || view.upgradeBusy || view.batchBusy || view.restartRunning) return
   const target = survey.target
   const f = fetchOf(view.doc)
   const base = view.options.apiBase ?? ''
 
+  // 本体升级会自己走重启链；之前没确认的重启意图先作废。
+  disarmRestart(view)
   view.upgradeBusy = true
   if (view.upgradeButton !== null) view.upgradeButton.disabled = true
   view.prerelease.disabled = true
   view.refreshButton.disabled = true
+  view.upgradeAllButton.disabled = true
   clearError(view)
   setNotice(view, '')
   resetProgress(view)
@@ -1024,8 +1308,9 @@ function finishHostBusy(view: View): void {
   // 本体这一轮到此结束（含预检与重启请求），阶段条收起来，剩下的用文字进度说话。
   hideHostProgress(view)
   view.upgradeBusy = false
-  view.prerelease.disabled = false
-  view.refreshButton.disabled = false
+  view.prerelease.disabled = view.batchBusy
+  view.refreshButton.disabled = view.batchBusy
+  view.upgradeAllButton.disabled = view.batchBusy
   if (view.upgradeButton !== null) {
     const blocked = view.survey !== null && view.survey.blocked !== null
     view.upgradeButton.disabled = blocked || !hasNewerTarget(view.survey)
@@ -1076,12 +1361,57 @@ async function consumeUpgrade(view: View, token: number, response: Response, tar
   await continueToRestart(view, token, target)
 }
 
-async function continueToRestart(view: View, token: number, target: string): Promise<void> {
+/** 预检失败事件里能给人看的原因：阶段名 + 第一条失败说明。 */
+function restartFailureDetail(event: Record<string, unknown>): string {
+  const stage = asString(event.stage)
+  const label = stage === '' ? '' : (RESTART_STAGE_LABELS[stage] ?? stage)
+  let message = ''
+  if (Array.isArray(event.failures)) {
+    for (const failure of event.failures) {
+      if (!isRecord(failure)) continue
+      message = compactReason(asString(failure.message))
+      if (message !== '') break
+    }
+  }
+  if (message === '') message = compactReason(asString(event.message))
+  if (message === '') return label
+  return label === '' ? message : label + '：' + message
+}
+
+/** 预检失败响应可能长成 {ok:false,error}、{message} 或纯文本；依次取第一句能看的。 */
+async function readFailureReason(response: Response): Promise<string> {
+  try {
+    const text = (await response.text()).trim()
+    if (text === '') return ''
+    try {
+      const parsed: unknown = JSON.parse(text)
+      if (isRecord(parsed)) {
+        const error = asString(parsed.error)
+        if (error !== '') return compactReason(error)
+        const message = asString(parsed.message)
+        if (message !== '') return compactReason(message)
+      }
+    } catch {
+      // 不是 JSON 就按纯文本用。
+    }
+    return compactReason(text)
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * status → precheck → restart 三步固定顺序；任何一步走不通就交给 onManual 说一句人话，
+ * 预检没过时绝不发 restart。成功时按调用方给的文案提示。
+ */
+async function runRestartChain(
+  view: View,
+  token: number,
+  onManual: (reason: string) => void,
+  successText = '正在重启…',
+): Promise<void> {
   const f = fetchOf(view.doc)
   const base = view.options.apiBase ?? ''
-  const manualRestart = (reason: string): void => {
-    setNotice(view, '已升级到 ' + target + '，' + reason + '，需手动重启')
-  }
 
   let status: Response
   try {
@@ -1091,13 +1421,13 @@ async function continueToRestart(view: View, token: number, target: string): Pro
       headers: { ...RESTART_HEADERS },
     })
   } catch {
-    if (live(view, token)) manualRestart('没找到 dsh-restart')
+    if (live(view, token)) onManual('连不上 dsh-restart')
     return
   }
   if (!live(view, token)) return
   if (!status.ok) {
     // 只有 404 才意味着插件不在；403/500 是「在，但拒绝/坏了」，不能误导人去装。
-    manualRestart(
+    onManual(
       status.status === 404
         ? '没找到 dsh-restart'
         : status.status === 401 || status.status === 403
@@ -1106,6 +1436,7 @@ async function continueToRestart(view: View, token: number, target: string): Pro
     )
     return
   }
+  setNotice(view, '正在预检…')
 
   let precheck: Response
   try {
@@ -1115,21 +1446,36 @@ async function continueToRestart(view: View, token: number, target: string): Pro
       headers: { ...RESTART_HEADERS },
     })
   } catch {
-    if (live(view, token)) manualRestart('预检请求发不出去')
+    if (live(view, token)) onManual('预检请求发不出去')
     return
   }
   if (!live(view, token)) return
   if (!precheck.ok) {
-    manualRestart('预检失败（HTTP ' + precheck.status + '）')
+    const reason = await readFailureReason(precheck)
+    if (!live(view, token)) return
+    onManual('预检失败（HTTP ' + precheck.status + (reason === '' ? '' : '：' + reason) + '）')
     return
   }
 
-  let passed = true
+  // 缺证据按失败算：只有明确收到 done 才允许重启。
+  let failed = false
+  let sawDone = false
+  let detail = ''
   try {
     await readNdjson(precheck, (event) => {
       if (!live(view, token)) return
-      if (event.ok === false) passed = false
-      if (event.error !== undefined && event.error !== null) passed = false
+      if (event.ok === false) {
+        failed = true
+        if (detail === '') detail = restartFailureDetail(event)
+      }
+      if (event.error !== undefined && event.error !== null) {
+        failed = true
+        if (detail === '') {
+          detail = compactReason(
+            isRecord(event.error) ? asString(event.error.message) : asString(event.error),
+          )
+        }
+      }
       const stage = asString(event.stage)
       if (stage !== '') {
         // 预检会克隆 profile 再起一个冒烟实例，几十秒没反馈像是卡死；把阶段推进度条。
@@ -1142,15 +1488,24 @@ async function continueToRestart(view: View, token: number, target: string): Pro
         return
       }
       // 失败事件也带 done；别让进度条写「完成」而下面的通知说没通过。
-      if (event.done === true && event.ok !== false && passed) addProgress(view, '重启预检完成')
+      if (event.done === true) {
+        sawDone = true
+        if (!failed && event.ok !== false) addProgress(view, '重启预检完成')
+      }
     })
   } catch {
-    if (live(view, token)) manualRestart('预检读到一半断了')
+    if (live(view, token)) onManual('预检读到一半断了')
     return
   }
   if (!live(view, token)) return
-  if (!passed) {
-    manualRestart('预检没通过')
+  if (failed) {
+    // 原因常驻面板，别让用户只看到一闪而过的红条就去猜哪里坏了。
+    onManual('预检没通过' + (detail === '' ? '' : '：' + detail))
+    return
+  }
+  if (!sawDone) {
+    // 流被截断或服务端没跑完：没有通过证据就不重启。
+    onManual('预检没有返回结果，未重启')
     return
   }
 
@@ -1162,186 +1517,65 @@ async function continueToRestart(view: View, token: number, target: string): Pro
       headers: { ...RESTART_HEADERS },
     })
   } catch {
-    if (live(view, token)) manualRestart('重启请求发不出去')
+    if (live(view, token)) onManual('重启请求发不出去')
     return
   }
   if (!live(view, token)) return
   if (restart.status === 409) {
-    setNotice(view, '已经有一轮重启在进行，请稍后手动刷新页面确认')
+    onManual('已经有一轮重启在进行，请稍后手动刷新页面确认')
     return
   }
   if (!restart.ok) {
-    manualRestart('重启请求失败（HTTP ' + restart.status + '）')
+    onManual('重启请求失败（HTTP ' + restart.status + '）')
     return
   }
-  setNotice(view, '已升级到 ' + target + '，正在重启…')
+  setNotice(view, successText)
 }
 
-async function runPluginUpdate(
-  view: View,
-  update: PluginUpdate,
-  row: PluginRowView,
-): Promise<void> {
-  const token = view.token
-  row.button.disabled = true
-  setRowState(row, '正在升级…')
-  setRowProgress(row, null, true)
-  try {
-    const f = fetchOf(view.doc)
-    const base = view.options.apiBase ?? ''
-    const started = await startPluginUpdate(update.name, f, base)
-    if (!live(view, token)) return
-    if (started.operationId === '') {
-      handlePluginStartFailure(row, started.code, started.message)
-      row.button.disabled = false
-      return
-    }
-
-    const interval = view.options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS
-    const stalledWaitMs = view.options.stalledWaitMs ?? DEFAULT_STALLED_WAIT_MS
-    let lastMove = ''
-    let movedAt = Date.now()
-    for (let round = 0; round < MAX_POLLS; round += 1) {
-      const operation = await pollPluginOperation(started.operationId, f, base)
-      if (!live(view, token)) return
-      if (operation.status === 'queued' || operation.status === 'running') {
-        const move = moveKey(operation)
-        if (move !== lastMove) {
-          lastMove = move
-          movedAt = Date.now()
-        } else if (Date.now() - movedAt >= stalledWaitMs) {
-          // 卡在「等会话结束」这类前进不了的地方：解锁按钮，把原因留在这一行。
-          setRowState(row, stalledReason(operation))
-          setRowProgress(row, null, false)
-          row.button.disabled = false
-          return
-        }
-        paintPluginRunning(row, operation)
-        await sleep(interval)
-        if (!live(view, token)) return
-        continue
-      }
-      handlePluginOperation(row, operation)
-      row.button.disabled = false
-      return
-    }
-    setRowState(row, '升级超时，稍后重试', true)
-    setRowProgress(row, null, false)
-    row.button.disabled = false
-  } catch {
-    if (!live(view, token)) return
-    setRowState(row, '插件升级请求失败，请稍后重试', true)
-    setRowProgress(row, null, false)
-    row.button.disabled = false
-  }
-}
-
-/** 判定「还在动」的指纹：状态、百分比、pnpm 输出任一变化都算推进。 */
-function moveKey(operation: PluginOperation): string {
-  const progress = operation.progress
-  return [
-    operation.status,
-    String(progress?.percent ?? ''),
-    String(progress?.done ?? ''),
-    String(progress?.detail ?? ''),
-  ].join('|')
-}
-
-/** 一直没推进时留在行里的话：等会话结束和真在跑要分开说，别让人以为装了一半。 */
-function stalledReason(operation: PluginOperation): string {
-  const agents = operation.wait?.activeAgentIds.length ?? 0
-  if (operation.status === 'queued' || agents > 0) {
-    return agents > 0
-      ? '还没开始升级：等 ' + String(agents) + ' 个运行中的会话结束后再点'
-      : '还没开始升级：一直在排队，稍后再点'
-  }
-  return '升级还在后台跑，先不等了：稍后打开面板看结果'
-}
-
-/** 运行中：状态写 pnpm 给的那一句，进度条按真实百分比走。 */
-function paintPluginRunning(row: PluginRowView, operation: PluginOperation): void {
-  const progress = operation.progress
-  if (operation.status === 'queued') {
-    const wait = operation.wait
-    const waiting =
-      wait !== undefined && wait.activeAgentIds.length > 0
-        ? '排队中，等 ' + String(wait.activeAgentIds.length) + ' 个运行中的会话结束'
-        : '排队中…'
-    setRowState(row, wait !== undefined && wait.message !== null ? wait.message : waiting)
-    setRowProgress(row, null, true)
-    return
-  }
-  const detail = progress?.detail ?? null
-  const percent = progress?.percent ?? null
-  const text =
-    detail !== null
-      ? compactReason(detail)
-      : percent !== null
-        ? '正在升级…' + String(percent) + '%'
-        : '正在升级…'
-  setRowState(row, text, false, detail ?? undefined)
-  setRowProgress(row, percent, true)
-}
-
-/**
- * 请求层不可用（市场没开、登录失效、记录丢失）不算安装失败，也不写红字；
- * 真失败把宿主的原因写进这一行——七个插件一起升级时底部一条红条认不出是谁。
- */
-function handlePluginStartFailure(
-  row: PluginRowView,
-  code: string | undefined,
-  message: string | undefined,
-): void {
-  if (isPluginUnavailableCode(code)) {
-    setRowState(row, '插件更新不可用')
-    setRowProgress(row, null, false)
-    return
-  }
-  setRowState(
-    row,
-    message !== undefined && message !== '' ? '升级失败：' + compactReason(message) : '升级失败',
-    true,
-    message,
+async function continueToRestart(view: View, token: number, target: string): Promise<void> {
+  await runRestartChain(
+    view,
+    token,
+    (reason) => {
+      setNotice(view, '已升级到 ' + target + '，' + reason + '，需手动重启')
+    },
+    '已升级到 ' + target + '，正在重启…',
   )
-  setRowProgress(row, null, false)
 }
 
-function handlePluginOperation(row: PluginRowView, operation: PluginOperation): void {
-  setRowProgress(row, null, false)
-  switch (operation.status) {
-    case 'succeeded':
-      setRowState(row, operation.restartRequired ? '已升级，重启 DSH 后生效' : '已升级')
-      return
-    case 'failed':
-      if (isPluginUnavailableCode(operation.code)) {
-        setRowState(row, '插件更新不可用')
-        return
-      }
-      setRowState(
-        row,
-        operation.message !== undefined && operation.message !== ''
-          ? '升级失败：' + compactReason(operation.message)
-          : '升级失败',
-        true,
-        operation.message,
-      )
-      return
-    case 'cancelled':
-      setRowState(row, '已取消')
-      return
-    case 'rolled-back':
-      setRowState(
-        row,
-        operation.message !== undefined && operation.message !== ''
-          ? '升级失败，已回滚：' + compactReason(operation.message)
-          : '升级失败，已回滚',
-        true,
-        operation.message,
-      )
-      return
-    default:
-      return
+/** 批量升级收工后按 dsh-restart 的可用性决定露不露重启入口。 */
+async function offerRestart(view: View, token: number): Promise<void> {
+  view.restartButton.hidden = true
+  view.restartButton.disabled = false
+  view.restartButton.textContent = '重启 DSH'
+  view.restartArmed = false
+
+  const f = fetchOf(view.doc)
+  const base = view.options.apiBase ?? ''
+  let status: Response
+  try {
+    status = await f(joinUrl(base, RESTART_STATUS_PATH), {
+      method: 'GET',
+      credentials: 'same-origin',
+      headers: { ...RESTART_HEADERS },
+    })
+  } catch {
+    // 查询期间用户可能又开了一轮批量：这时的旧答案不能把按钮塞回面板。
+    if (!live(view, token) || view.batchBusy) return
+    setNotice(view, '插件已升级，连不上 dsh-restart，需手动重启 dsh web 才生效')
+    return
   }
+  if (!live(view, token) || view.batchBusy) return
+  if (status.status === 200) {
+    view.restartButton.hidden = false
+    setNotice(view, '插件已升级，可点「重启 DSH」让改动生效')
+    return
+  }
+  if (status.status === 404) {
+    setNotice(view, '插件已升级，需手动重启 dsh web 才生效')
+    return
+  }
+  setNotice(view, '插件已升级，但重启不可用（HTTP ' + status.status + '），需手动重启 dsh web')
 }
 
 /**

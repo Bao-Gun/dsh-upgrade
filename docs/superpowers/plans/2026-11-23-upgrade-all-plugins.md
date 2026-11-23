@@ -122,8 +122,8 @@ git commit -m "feat(client): 串行批量升级队列（顺序、失败继续、
 **Interfaces:**
 - Consumes: `runBatch` 在 Task 1 产出的 `BatchItem` 类型；`DEFAULT_POLL_INTERVAL_MS`、`DEFAULT_STALLED_WAIT_MS` 从 `./batch` 导出。
 - Produces:
-  - `type PluginRowView = { root: HTMLElement; name: HTMLElement; version: HTMLElement; state: HTMLElement; bar: HTMLElement; fill: HTMLElement; progressText: HTMLElement }`（**没有 button 字段**）
-  - `function paintBatchItem(row: PluginRowView, item: BatchItem): void`（用例在 Task 3）—— 把 `BatchItem` 画到这一行：`running` 时按 `percent` 画条（null → 不确定进度）并把 `detail ?? '正在升级…N%'` 写进 `progressText`；`succeeded` 收起条写「已升级」（`restartRequired` 由批量层决定是否改文案，这里只画行内终态）；`failed` 且 `unavailable` 写「插件更新不可用」（不红）；`failed` 且非 unavailable 写「升级失败：」+ 压缩后的 message（红字 + `title` 存全文）；`pending` 收起进度条清空文字。
+  - `type PluginRowView = { root: HTMLElement; name: HTMLElement; version: HTMLElement; state: HTMLElement; progress: HTMLElement; bar: HTMLElement; fill: HTMLElement; progressText: HTMLElement }`（**没有 button 字段**；`progress` 是整块进度容器，R41：`setRowProgress` 必须切它的 `hidden`，只切 bar 会让进度永远不可见）
+  - `function paintBatchItem(row: PluginRowView, item: BatchItem): void`（用例在 Task 3）—— 把 `BatchItem` 画到这一行：`running` 时按 `percent` 画条（null → 不确定进度）并把 `message ?? detail ?? '正在升级…N%'` 写进 `progressText`（R36：批量层把「等 N 个运行中的会话结束」放在 message 里）；终态文案不重复加前缀（R38：message 已是完整句子——以「升级失败」「已」开头或等于「插件更新不可用」——就直接显示，只有纯原因才加「升级失败：」）；`succeeded` 收起条写「已升级」（`restartRequired` 由批量层决定是否改文案，这里只画行内终态）；`failed` 且 `unavailable` 写「插件更新不可用」（不红）；`failed` 且非 unavailable 写「升级失败：」+ 压缩后的 message（红字 + `title` 存全文）；`pending` 收起进度条清空文字。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -185,6 +185,11 @@ git commit -m "refactor(client): 插件行改两行式，删掉单包升级路�
 6. `请求层不可用不画红字`：`POST` 返 500（`MARKET_UNAVAILABLE`），断言该行文案是「插件更新不可用」且没有 `data-error`。
 7. `批量进行中关闭面板，剩下的包不再发请求`：两个包，第一个成功后关闭面板，断言 `POST` 只发生过一次、且后续 ticking 不抛错（`view.closed` → `cancelled()`）。
 
+再加 2 条：
+
+8. `排队时行里说清在等几个会话`：第 2 个包（或第 1 个包）返回 `queued` + `wait.activeAgentIds: ['s1','s2']`，断言该行 `.dshu-plugin-progress-text` 文案含「等 2 个运行中的会话结束」（R36）。
+9. `点全部升级时先清掉上一轮的残留文案`：先让某行显示过「已升级」，再点一次「全部升级」，断言开跑瞬间该行文案被清空、进度条收起（R39）。
+
 再加 1 条（可并入用例 2）：`升级期间本体升级按钮、重新检查、预发布开关都按住` —— 批量进行中断言 `.dshu-refresh`、`.dshu-prerelease`、`.dshu-upgrade-btn`（存在时）的 `disabled === true`，结束后恢复。
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -197,7 +202,7 @@ Expected: FAIL（`.dshu-upgrade-all` 为 null）。
 - `buildView`：插件段的 `h3.dshu-plugin-head`（现在 `panel.ts:495-496`）包进一行 `div.dshu-plugins-head`，同一行右侧放按钮——`pluginsSection.append(pluginsHead, pluginList, pluginSummary)`，`pluginsHead = [pluginHead, upgradeAll, restartButton]`（用户 m01298 要求按钮与「插件（N 个可更新）」标题同一行）。`.dshu-upgrade-all` 文案「全部升级」，`.dshu-restart` 文案「重启 DSH」且 `hidden = true`；`pluginSummary` 仍是列表下方的汇总行，`hidden = true`。
 - CSS 新增：`.dshu-plugins-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0}`、`.dshu-plugins-head h3{margin:0}`、`.dshu-plugins-head .dshu-upgrade-all{margin-left:auto}`、`.dshu-upgrade-all{padding:4px 10px;font-size:12px;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.12));border-radius:var(--dsw-radius-sm,6px);background:transparent;color:inherit;font:inherit;cursor:pointer}`、`.dshu-plugin-summary{font-size:12px;color:var(--dsw-alias-label-tertiary,inherit)}`；`.dshu-upgrade-all:disabled{opacity:.5;cursor:default}`。
 - `renderPlugins`：重建 `view.rows`（`rows.set(update.name, row)`）；`updatable.length === 0` 或 `!available` 时隐藏 `.dshu-upgrade-all`、清空 `rows`、隐藏 `pluginSummary`。
-- 点击处理：`startBatch(view)` —— `batchBusy = true`、`setBatchBusy(view, true)`（禁用全部升级/本体升级/重新检查/预发布，文案「升级中…」，隐藏 `pluginSummary`）、`await runBatch(names, fetchOf(doc), base, { pollIntervalMs, stalledWaitMs, cancelled: () => view.closed, onEvent })`，`onEvent` 里 `const row = view.rows.get(item.name)`，有才 `paintBatchItem(row, item)`；结束后写汇总 `n 个已升级，m 个失败`（只在 m > 0 时带失败数），`setBatchBusy(view, false)`，`live(view, token)` 为假时后面什么都不做。
+- 点击处理：`startBatch(view)` —— 先对 `view.rows` 每个值 `paintBatchItem(row, { name, state: 'pending', percent: null, detail: null, message: null, unavailable: false })` 清掉上一轮残留文案（R39：batch 的首个事件要等第一次轮询后才来，`pending` 事件从不发出）；`batchBusy = true`、`setBatchBusy(view, true)`（禁用全部升级/本体升级/重新检查/预发布，文案「升级中…」，隐藏 `pluginSummary`）、`await runBatch(names, fetchOf(doc), base, { pollIntervalMs, stalledWaitMs, cancelled: () => view.closed, onEvent })`，`onEvent` 里 `const row = view.rows.get(item.name)`，有才 `paintBatchItem(row, item)`；结束后写汇总 `n 个已升级，m 个失败`（只在 m > 0 时带失败数），`setBatchBusy(view, false)`，`live(view, token)` 为假时后面什么都不做。
 - `setBatchBusy` 与既有 `setHostBusy`/`setHostIdle` 互斥：本体忙时禁用全部升级，批量忙时禁用本体升级按钮与重查/预发布。
 
 - [ ] **Step 4: 跑测试确认通过**
