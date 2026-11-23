@@ -95,7 +95,11 @@ export function pickNewest(
   return best
 }
 
-type RangeVersion = ParsedVersion & { parts: 1 | 2 | 3 }
+type RangeVersion = ParsedVersion & {
+  /** 通配符之前的具体段数，`*` 为 0 */
+  parts: number
+  wildcard: boolean
+}
 
 type Comparator = {
   operator: '^' | '~' | '>=' | '>' | '<=' | '<' | '='
@@ -103,24 +107,34 @@ type Comparator = {
 }
 
 const RANGE_VERSION_RE =
-  /^[vV]?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/
+  /^[vV]?(\d+|[xX*])(?:\.(\d+|[xX*]))?(?:\.(\d+|[xX*]))?(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/
+
+function isWildcardPart(part: string): boolean {
+  return part === 'x' || part === 'X' || part === '*'
+}
 
 function parseRangeVersion(raw: string): RangeVersion | null {
   const m = RANGE_VERSION_RE.exec(raw)
   if (!m) return null
-  const major = m[1]
-  if (major === undefined) return null
-  const minor = m[2]
-  const patch = m[3]
+  const numbers: number[] = []
+  let wildcard = false
+  for (const group of [m[1], m[2], m[3]]) {
+    if (group === undefined) break
+    if (isWildcardPart(group)) {
+      wildcard = true
+      break
+    }
+    numbers.push(Number(group))
+  }
   const prerelease = m[4] === undefined ? [] : m[4].split('.')
   if (prerelease.some((part) => part === '')) return null
-  const parts = patch !== undefined ? 3 : minor !== undefined ? 2 : 1
   return {
-    major: Number(major),
-    minor: minor === undefined ? 0 : Number(minor),
-    patch: patch === undefined ? 0 : Number(patch),
+    major: numbers[0] ?? 0,
+    minor: numbers[1] ?? 0,
+    patch: numbers[2] ?? 0,
     prerelease,
-    parts,
+    parts: numbers.length,
+    wildcard,
   }
 }
 
@@ -137,49 +151,105 @@ function plain(major: number, minor: number, patch: number): ParsedVersion {
   return { major, minor, patch, prerelease: [] }
 }
 
-function caretUpper(v: RangeVersion): ParsedVersion {
-  if (v.major > 0) return plain(v.major + 1, 0, 0)
-  if (v.minor > 0) return plain(0, v.minor + 1, 0)
-  return plain(0, 0, v.patch + 1)
+function floorOf(v: RangeVersion): ParsedVersion {
+  return { major: v.major, minor: v.minor, patch: v.patch, prerelease: v.prerelease }
 }
 
-function tildeUpper(v: RangeVersion): ParsedVersion {
+type Bounds = {
+  lower: ParsedVersion
+  upper: ParsedVersion | null
+  upperInclusive: boolean
+}
+
+function boundsOf(v: RangeVersion): Bounds {
+  const lower = floorOf(v)
+  if (!v.wildcard && v.parts === 3) return { lower, upper: lower, upperInclusive: true }
+  if (v.parts === 0) return { lower, upper: null, upperInclusive: false }
+  const upper = v.parts === 1 ? plain(v.major + 1, 0, 0) : plain(v.major, v.minor + 1, 0)
+  return { lower, upper, upperInclusive: false }
+}
+
+function caretUpper(v: RangeVersion): ParsedVersion | null {
+  if (v.parts === 0) return null
+  if (v.major > 0) return plain(v.major + 1, 0, 0)
+  if (v.minor > 0) return plain(0, v.minor + 1, 0)
+  if (v.patch > 0) return plain(0, 0, v.patch + 1)
+  if (v.parts === 1) return plain(1, 0, 0)
+  if (v.parts === 2) return plain(0, 1, 0)
+  return plain(0, 0, 1)
+}
+
+function tildeUpper(v: RangeVersion): ParsedVersion | null {
+  if (v.parts === 0) return null
   if (v.parts >= 2) return plain(v.major, v.minor + 1, 0)
   return plain(v.major + 1, 0, 0)
 }
 
 function matchesComparator(c: Comparator, current: ParsedVersion): boolean {
+  const v = c.version
+  if (v.parts === 0 && v.wildcard) return true
+  const b = boundsOf(v)
   switch (c.operator) {
-    case '>':
-      return compareParsed(current, c.version) > 0
-    case '>=':
-      return compareParsed(current, c.version) >= 0
-    case '<':
-      return compareParsed(current, c.version) < 0
-    case '<=':
-      return compareParsed(current, c.version) <= 0
-    case '^':
-      return (
-        compareParsed(current, c.version) >= 0 &&
-        compareParsed(current, caretUpper(c.version)) < 0
-      )
-    case '~':
-      return (
-        compareParsed(current, c.version) >= 0 &&
-        compareParsed(current, tildeUpper(c.version)) < 0
-      )
     case '=':
-      return compareParsed(current, c.version) === 0
+      if (b.upper === null) return true
+      return (
+        compareParsed(current, b.lower) >= 0 &&
+        (b.upperInclusive
+          ? compareParsed(current, b.upper) <= 0
+          : compareParsed(current, b.upper) < 0)
+      )
+    case '>':
+      if (b.upper === null) return false
+      if (b.upperInclusive) return compareParsed(current, b.lower) > 0
+      return compareParsed(current, b.upper) >= 0
+    case '>=':
+      return compareParsed(current, b.lower) >= 0
+    case '<':
+      return compareParsed(current, b.lower) < 0
+    case '<=':
+      if (b.upper === null) return true
+      if (b.upperInclusive) return compareParsed(current, b.lower) <= 0
+      return compareParsed(current, b.upper) < 0
+    case '^': {
+      const upper = caretUpper(v)
+      if (upper === null) return true
+      return compareParsed(current, b.lower) >= 0 && compareParsed(current, upper) < 0
+    }
+    case '~': {
+      const upper = tildeUpper(v)
+      if (upper === null) return true
+      return compareParsed(current, b.lower) >= 0 && compareParsed(current, upper) < 0
+    }
   }
 }
 
+function satisfiesHyphen(segment: string, current: ParsedVersion): boolean | null {
+  const m = /^(\S+)\s+-\s+(\S+)$/.exec(segment)
+  if (m === null) return null
+  const left = parseRangeVersion(m[1] ?? '')
+  const right = parseRangeVersion(m[2] ?? '')
+  // 看得出是连字符范围但端点读不懂：按无法解析处理，放行
+  if (left === null || right === null) return true
+  if (left.parts > 0 && compareParsed(current, floorOf(left)) < 0) return false
+  if (right.parts === 0) return true
+  if (!right.wildcard && right.parts === 3) {
+    return compareParsed(current, floorOf(right)) <= 0
+  }
+  const upper =
+    right.parts === 1 ? plain(right.major + 1, 0, 0) : plain(right.major, right.minor + 1, 0)
+  return compareParsed(current, upper) < 0
+}
+
 function satisfiesSegment(segment: string, current: ParsedVersion): boolean {
-  const normalized = segment.replace(/([<>~^=]+)\s+/g, '$1').trim()
-  if (normalized === '') return true
+  const raw = segment.trim()
+  if (raw === '') return true
+  const hyphen = satisfiesHyphen(raw, current)
+  if (hyphen !== null) return hyphen
+  const normalized = raw.replace(/([<>~^=]+)\s+/g, '$1')
   for (const token of normalized.split(/\s+/)) {
     if (token === '') continue
     const comparator = parseComparator(token)
-    // 解析不了的范围宁可放行，也不因解析失败误拦升级
+    // 真正无法解析的文本宁可放行，也不因解析失败误拦升级
     if (comparator === null) return true
     if (!matchesComparator(comparator, current)) return false
   }
