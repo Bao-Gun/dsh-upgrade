@@ -844,6 +844,8 @@ describe('全部升级', () => {
     expect(summary?.textContent).toBe('1 个已升级，1 个失败，1 个跳过')
     expect(callsTo(calls, 'POST', '/dsh-market/api/v1/updates')).toHaveLength(2)
     expect(document.querySelector('[data-name="c"] .dshu-plugin-state')?.textContent).toBe('已跳过')
+    // 失败原因留在汇总行，底栏不冒红条。
+    expect(errorBar()).toBeNull()
     closePanel()
   })
 
@@ -913,6 +915,25 @@ describe('全部升级后的重启', () => {
 
     expect(document.querySelector<HTMLButtonElement>('.dshu-restart')?.hidden).toBe(true)
     expect(noticeText()).toContain('插件已升级')
+    closePanel()
+  })
+
+  test('批量后连不上 dsh-restart：说清网络失败，不冒充「没装」', async () => {
+    serve({
+      ...batchRoutes({ packages: ['a'] }),
+      'GET /dsh-restart/api/status': () => {
+        throw new Error('offline')
+      },
+    })
+    await openPanel(document, { pollIntervalMs: 10 })
+
+    document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')?.click()
+    await waitFor(() => noticeText().includes('连不上 dsh-restart'))
+
+    expect(noticeText()).toContain('插件已升级')
+    expect(noticeText()).toContain('需手动重启')
+    expect(noticeText()).not.toContain('重启不可用')
+    expect(document.querySelector<HTMLButtonElement>('.dshu-restart')?.hidden).toBe(true)
     closePanel()
   })
 
@@ -1008,6 +1029,47 @@ describe('全部升级后的重启', () => {
     expect(button.textContent).toBe('确认重启？')
     expect(callsTo(calls, 'POST', '/dsh-restart/api/precheck')).toHaveLength(0)
     vi.useRealTimers()
+    closePanel()
+  })
+
+  test('重启链在途时「全部升级」被按住，链结束后恢复', async () => {
+    let statusCalls = 0
+    let releaseStatus!: (value: FakeResponse) => void
+    const gate = new Promise<FakeResponse>((resolve) => {
+      releaseStatus = resolve
+    })
+    const routes = batchRoutes({ packages: ['a'] })
+    routes['GET /dsh-restart/api/status'] = () => {
+      statusCalls += 1
+      return statusCalls === 1 ? jsonResponse({ ok: true, health: true, port: 3080 }) : gate
+    }
+    const calls = serve(routes)
+    await openPanel(document, { pollIntervalMs: 10 })
+
+    document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')?.click()
+    await waitFor(() => document.querySelector<HTMLButtonElement>('.dshu-restart')?.hidden === false)
+    const button = document.querySelector<HTMLButtonElement>('.dshu-restart')
+    await confirmRestart(button)
+    await waitFor(() => statusCalls >= 2)
+
+    const all = document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')
+    expect(all?.disabled).toBe(true)
+    // 文案保持不变；只有批量自己在跑时才写「升级中…」。
+    expect(all?.textContent).toBe('全部升级')
+    expect(document.querySelector<HTMLButtonElement>('.dshu-refresh')?.disabled).toBe(true)
+    expect(document.querySelector<HTMLInputElement>('.dshu-prerelease')?.disabled).toBe(true)
+
+    // 链在途时再点：不能起第二轮批量（此前那一轮的 1 次 POST 是基线）。
+    all?.click()
+    expect(callsTo(calls, 'POST', '/dsh-market/api/v1/updates')).toHaveLength(1)
+
+    releaseStatus(jsonResponse({ code: 'NOT_FOUND', message: '没有 dsh-restart' }, 404))
+    await waitFor(() => noticeText().includes('没找到 dsh-restart'))
+    expect(all?.disabled).toBe(false)
+    expect(document.querySelector<HTMLButtonElement>('.dshu-refresh')?.disabled).toBe(false)
+    expect(document.querySelector<HTMLInputElement>('.dshu-prerelease')?.disabled).toBe(false)
+    expect(button?.disabled).toBe(false)
+    expect(button?.textContent).toBe('重启 DSH')
     closePanel()
   })
 

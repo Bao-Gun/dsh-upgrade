@@ -122,7 +122,7 @@ const STYLE_TEXT = [
   '.dshu-plugins-head h3{margin:0}',
   '.dshu-plugins-head .dshu-upgrade-all{margin-left:auto}',
   '.dshu-upgrade-all,.dshu-restart{padding:4px 10px;font-size:12px;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.12));border-radius:var(--dsw-radius-sm,6px);background:transparent;color:inherit;font-family:inherit;cursor:pointer}',
-  '.dshu-upgrade-all:disabled{opacity:.5;cursor:default}',
+  '.dshu-upgrade-all:disabled,.dshu-restart:disabled{opacity:.5;cursor:default}',
   '.dshu-plugin-summary{font-size:12px;color:var(--dsw-alias-label-tertiary,inherit)}',
   '.dshu-plugin-summary[hidden]{display:none}',
   '.dshu-plugin{display:flex;flex-direction:column;gap:4px;padding:10px;border-radius:var(--dsw-radius-sm,6px);background:var(--dsw-alias-bg-layer-2,rgba(0,0,0,.03))}',
@@ -598,6 +598,7 @@ function buildView(doc: Document, options: PanelOptions): View {
     view.restartArmedAt = null
     // 同步连点也在这一刻被挡住：一次确认只允许启动一条链。
     view.restartRunning = true
+    setRestartBusy(view, true)
     restartButton.textContent = '重启中…'
     restartButton.disabled = true
     // 插件批量没有本体升级的阶段条；清掉上一轮残留，让预检从干净的面板开始。
@@ -606,7 +607,7 @@ function buildView(doc: Document, options: PanelOptions): View {
     const token = view.token
     void runRestartChain(view, token, (reason) => {
       if (!live(view, token)) return
-      view.restartRunning = false
+      setRestartBusy(view, false)
       restartButton.disabled = false
       restartButton.textContent = '重启 DSH'
       setNotice(view, '重启不可用：' + reason)
@@ -1085,17 +1086,18 @@ function hostUpgradeDisabled(view: View): boolean {
     view.survey.blocked !== null ||
     !hasNewerTarget(view.survey) ||
     view.batchBusy ||
-    view.upgradeBusy
+    view.upgradeBusy ||
+    view.restartRunning
   )
 }
 
 /** 批量忙时按住所有会重画或并发起升级的入口；本体忙时反过来按住「全部升级」。 */
 function setBatchBusy(view: View, busy: boolean): void {
   view.batchBusy = busy
-  view.upgradeAllButton.disabled = busy || view.upgradeBusy
+  view.upgradeAllButton.disabled = busy || view.upgradeBusy || view.restartRunning
   view.upgradeAllButton.textContent = busy ? '升级中…' : '全部升级'
-  view.prerelease.disabled = busy || view.upgradeBusy
-  view.refreshButton.disabled = busy || view.upgradeBusy
+  view.prerelease.disabled = busy || view.upgradeBusy || view.restartRunning
+  view.refreshButton.disabled = busy || view.upgradeBusy || view.restartRunning
   if (view.upgradeButton !== null) {
     if (busy) {
       view.upgradeButton.disabled = true
@@ -1106,12 +1108,25 @@ function setBatchBusy(view: View, busy: boolean): void {
   emitState(view)
 }
 
+/** 重启链在途：按住所有能起新工作的入口；失败收尾时由调用方解除。 */
+function setRestartBusy(view: View, busy: boolean): void {
+  view.restartRunning = busy
+  const blocked = busy || view.batchBusy || view.upgradeBusy
+  view.upgradeAllButton.disabled = blocked
+  view.prerelease.disabled = blocked
+  view.refreshButton.disabled = blocked
+  if (view.upgradeButton !== null) {
+    view.upgradeButton.disabled = busy ? true : hostUpgradeDisabled(view)
+  }
+  emitState(view)
+}
+
 /**
  * 「全部升级」：先把每行清成 pending（上一轮的结果不能留在屏幕上），再串行跑。
  * 事件只改对应名字的那一行；面板关了就停手，剩下的包由 runBatch 记成 skipped。
  */
 async function startBatch(view: View): Promise<void> {
-  if (view.batchBusy || view.upgradeBusy) return
+  if (view.batchBusy || view.upgradeBusy || view.restartRunning) return
   const plugins = view.plugins
   if (plugins === null || !plugins.available || plugins.updatable.length === 0) return
   const names = plugins.updatable.map((update) => update.name)
@@ -1240,7 +1255,7 @@ async function loadPlugins(view: View, token: number): Promise<void> {
 
 async function runHostUpgrade(view: View, token: number): Promise<void> {
   const survey = view.survey
-  if (survey === null || !hasNewerTarget(survey) || view.upgradeBusy || view.batchBusy) return
+  if (survey === null || !hasNewerTarget(survey) || view.upgradeBusy || view.batchBusy || view.restartRunning) return
   const target = survey.target
   const f = fetchOf(view.doc)
   const base = view.options.apiBase ?? ''
@@ -1397,7 +1412,6 @@ async function runRestartChain(
 ): Promise<void> {
   const f = fetchOf(view.doc)
   const base = view.options.apiBase ?? ''
-  setNotice(view, '正在预检…')
 
   let status: Response
   try {
@@ -1422,6 +1436,7 @@ async function runRestartChain(
     )
     return
   }
+  setNotice(view, '正在预检…')
 
   let precheck: Response
   try {
@@ -1547,7 +1562,7 @@ async function offerRestart(view: View, token: number): Promise<void> {
   } catch {
     // 查询期间用户可能又开了一轮批量：这时的旧答案不能把按钮塞回面板。
     if (!live(view, token) || view.batchBusy) return
-    setNotice(view, '插件已升级，需手动重启 dsh web 才生效')
+    setNotice(view, '插件已升级，连不上 dsh-restart，需手动重启 dsh web 才生效')
     return
   }
   if (!live(view, token) || view.batchBusy) return

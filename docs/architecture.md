@@ -31,7 +31,7 @@
 
 ### 插件：全部升级 → runBatch → dshmarket → 汇总 → 可选重启
 
-点「全部升级」→ `panel.startBatch` 先把每行按 `pending` 清空（上一轮文案不残留）→ `runBatch(names)` 串行：`POST /dsh-market/api/v1/updates {packageName}` 拿 operationId，随后每 `DEFAULT_POLL_INTERVAL_MS`（800ms）`GET /dsh-market/api/v1/operations/<id>`；非终态发 `running`（percent / detail / 排队原因），终态发 `settled`，一个包到终态才起下一个 → `panel` 只按 `item.name` 把事件画到对应行（`paintBatchItem`）→ 结束后写汇总「n 个已升级，m 个失败，k 个跳过（，需重启生效）」，并按 `summary.skipped` 给对应行补「已跳过」（batch 对跳过项不发事件）→ 有成功项时 `offerRestart`：`GET /dsh-restart/api/status` 200 露出「重启 DSH」，404 提示手动重启，其它状态码写明 HTTP 码 → 点按钮第一下只进「确认重启？」，第二下才走 precheck → restart。
+点「全部升级」→ `panel.startBatch` 先把每行按 `pending` 清空（上一轮文案不残留）→ `runBatch(names)` 串行：`POST /dsh-market/api/v1/updates {packageName}` 拿 operationId，随后每 `DEFAULT_POLL_INTERVAL_MS`（800ms）`GET /dsh-market/api/v1/operations?operationId=<id>`；非终态发 `running`（percent / detail / 排队原因），终态发 `settled`，一个包到终态才起下一个 → `panel` 只按 `item.name` 把事件画到对应行（`paintBatchItem`）→ 结束后写汇总「n 个已升级，m 个失败，k 个跳过（，需重启生效）」，并按 `summary.skipped` 给对应行补「已跳过」（batch 对跳过项不发事件）→ 有成功项时 `offerRestart`：`GET /dsh-restart/api/status` 200 露出「重启 DSH」，404 提示手动重启，其它状态码写明 HTTP 码 → 点按钮第一下只进「确认重启？」，第二下才走 status → precheck → restart。
 
 ### 服务端 → 本机安装目录
 
@@ -43,7 +43,7 @@
 
 ### 服务端 → dsh-restart
 
-本体升级成功后 `panel` 先 POST `/dsh-restart/api/precheck`（NDJSON）再 POST `/dsh-restart/api/restart`，让服务带着新版本重启；404（没装 dsh-restart）则显示「已升级，需手动重启」，不假装成功。插件批量走同一条链：有成功项时先 GET `/dsh-restart/api/status` 决定露不露「重启 DSH」按钮，点了才 precheck → restart。
+本体升级成功后 `panel` 先 GET `/dsh-restart/api/status` 确认插件在（404 或连不上则显示「已升级，需手动重启」，不假装成功），再 POST `/dsh-restart/api/precheck`（NDJSON，必须读到 done 才继续），最后 POST `/dsh-restart/api/restart`，让服务带着新版本重启。插件批量走同一条链：有成功项时先 GET status 决定露不露「重启 DSH」按钮（404「没装」、网络失败「连不上」、其它状态码分别提示）；点了按钮后再走一次 status → precheck → restart。
 
 ## 关键约束
 
