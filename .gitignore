@@ -1,4 +1,6 @@
 node_modules/
+# 安装脚本只在 --apply 时同步 profile 的锁文件；仓库自身的依赖锁不入库
+package-lock.json
 __pycache__/
 .venv/
 dist/
