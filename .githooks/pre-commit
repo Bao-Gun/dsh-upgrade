@@ -1,0 +1,17 @@
+#!/bin/sh
+# 文档漂移的反向检查：文档里点过名的源文件被改了，那份文档必须同批改。
+# 启用：git config core.hooksPath .githooks
+changed=$(git diff --cached --name-only --diff-filter=ACM)
+srcs=$(printf '%s\n' "$changed" | grep -E '^(src|app|lib)/.*\.(py|ts|tsx|js|go|rs)$' || true)
+[ -z "$srcs" ] && exit 0
+fail=0
+for f in $srcs; do
+  refs=$(grep -rlF --include='*.md' "${f}" docs specs 2>/dev/null || true)
+  for d in $refs; do
+    if ! printf '%s\n' "$changed" | grep -qx "${d}"; then
+      echo "[doc-drift] ${d} 引用了 ${f} - 但这次没一起改" >&2
+      fail=1
+    fi
+  done
+done
+exit $fail

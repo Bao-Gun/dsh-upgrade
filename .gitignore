@@ -1,0 +1,12 @@
+node_modules/
+__pycache__/
+.venv/
+dist/
+build/
+.env
+.env.*
+*.local
+.DS_Store
+
+# agent 的草稿、计划、临时分析，不进 git
+.work/
