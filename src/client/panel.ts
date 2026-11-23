@@ -11,12 +11,7 @@
  * .dshu-error 红条或 .dshu-notice 提示。
  */
 
-import {
-  DEFAULT_POLL_INTERVAL_MS,
-  DEFAULT_STALLED_WAIT_MS,
-  MAX_POLLS,
-  type BatchItem,
-} from './batch'
+import { DEFAULT_POLL_INTERVAL_MS, DEFAULT_STALLED_WAIT_MS, type BatchItem } from './batch'
 import { fetchPluginUpdates, type PluginUpdate, type PluginUpdates } from './market'
 
 export type PanelState = {
@@ -824,13 +819,14 @@ function renderPlugins(view: View): void {
 }
 
 /** 一行插件需要的全部节点：状态与失败原因都写在这一行里，不往面板底部抛。 */
-type PluginRowView = {
+export type PluginRowView = {
   root: HTMLElement
   name: HTMLElement
   version: HTMLElement
   state: HTMLElement
   bar: HTMLElement
   fill: HTMLElement
+  progress: HTMLElement
   progressText: HTMLElement
 }
 
@@ -856,13 +852,15 @@ function createPluginRow(view: View, update: PluginUpdate): PluginRowView {
   const progressText = element(doc, 'div', 'dshu-plugin-progress-text')
   progress.append(bar, progressText)
   root.append(line, state, progress)
-  return { root, name, version, state, bar, fill, progressText }
+  return { root, name, version, state, bar, fill, progress, progressText }
 }
 
 /** 行内状态：失败用红字，并且清掉上一轮的进度条。 */
 function setRowState(row: PluginRowView, text: string, isError = false, full?: string): void {
   row.state.textContent = text
   row.state.title = full ?? ''
+  // 没有状态文字时整行收起，免得行与进度块之间留一条空缝。
+  row.state.hidden = text === ''
   if (isError) row.state.setAttribute('data-error', '')
   else row.state.removeAttribute('data-error')
 }
@@ -881,6 +879,7 @@ function compactReason(raw: string, limit = 90): string {
 
 /** percent 为 null 表示 pnpm 还没报总量：画不确定进度（来回跑），不假装 0%。 */
 function setRowProgress(row: PluginRowView, percent: number | null, visible: boolean): void {
+  row.progress.hidden = !visible
   row.bar.hidden = !visible
   if (!visible) {
     row.bar.removeAttribute('data-indeterminate')
@@ -902,7 +901,7 @@ function setRowProgress(row: PluginRowView, percent: number | null, visible: boo
  * 这里只做两件事：把 pnpm 的长 output 压成一句、给真失败上红字。
  * message 与 unavailable 由批量层判定；请求层不可用不是安装失败，不红。
  */
-function paintBatchItem(row: PluginRowView, item: BatchItem): void {
+export function paintBatchItem(row: PluginRowView, item: BatchItem): void {
   switch (item.state) {
     case 'pending':
       setRowState(row, '')
@@ -912,11 +911,15 @@ function paintBatchItem(row: PluginRowView, item: BatchItem): void {
     case 'running': {
       const percent = item.percent
       // 行内文案按批量层给的优先级：排队提示（message）> pnpm 原话（detail）> 百分比。
+      // detail 是 pnpm 的整行输出，压成一句，免得行高忽上忽下。
       setRowState(row, '')
       row.progressText.textContent =
         item.message ??
-        item.detail ??
-        (percent !== null ? '正在升级…' + String(percent) + '%' : '正在升级…')
+        (item.detail !== null
+          ? compactReason(item.detail)
+          : percent !== null
+            ? '正在升级…' + String(percent) + '%'
+            : '正在升级…')
       setRowProgress(row, percent, true)
       return
     }
@@ -933,19 +936,26 @@ function paintBatchItem(row: PluginRowView, item: BatchItem): void {
         return
       }
       const message = item.message
-      // 批量层的 message 可能是纯原因（补「升级失败：」），也可能已经是完整句子（直接显示）。
+      // 批量层的 message 有纯原因与完整句两种：完整句不再补前缀，但同样压成一句、全文进 title。
+      const stalled =
+        message !== null &&
+        (message.startsWith('还没开始升级') ||
+          message.startsWith('升级还在后台跑') ||
+          message.startsWith('一直在排队'))
       const complete =
         message !== null &&
         (message.startsWith('升级失败') ||
           message.startsWith('已') ||
-          message === '插件更新不可用')
+          message === '插件更新不可用' ||
+          stalled)
       const text =
         message === null || message === ''
           ? '升级失败'
           : complete
-            ? message
+            ? compactReason(message)
             : '升级失败：' + compactReason(message)
-      setRowState(row, text, true, message ?? undefined)
+      // 排队/卡住只是没开始，不是安装失败，不上红字。
+      setRowState(row, text, !stalled, message ?? undefined)
       return
     }
   }

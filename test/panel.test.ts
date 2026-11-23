@@ -7,7 +7,7 @@
  * 退回 text() 的路径——后者是测试环境最容易漏掉的一条。
  */
 import { afterEach, describe, expect, test, vi } from 'vitest'
-import { closePanel, openPanel, probeHasUpdate } from '../src/client/panel'
+import { closePanel, openPanel, paintBatchItem, probeHasUpdate, type PluginRowView } from '../src/client/panel'
 import { apply } from '../src/client/index'
 
 type Call = { url: string, method: string, headers: Record<string, string>, body: unknown }
@@ -171,6 +171,27 @@ function hostSection(): Element | null {
 
 function pluginsSection(): Element | null {
   return document.querySelector('.dshu-section[data-k="plugins"]')
+}
+
+/** 把渲染出来的插件行还原成 PluginRowView，供 paintBatchItem 的单态用例直接驱动。 */
+function pluginRowView(name: string): PluginRowView {
+  const root = document.querySelector<HTMLElement>('.dshu-plugin[data-name="' + name + '"]')
+  if (root === null) throw new Error('missing plugin row: ' + name)
+  const pick = (selector: string): HTMLElement => {
+    const el = root.querySelector<HTMLElement>(selector)
+    if (el === null) throw new Error('missing ' + selector)
+    return el
+  }
+  return {
+    root,
+    name: pick('.dshu-plugin-name'),
+    version: pick('.dshu-plugin-version'),
+    state: pick('.dshu-plugin-state'),
+    bar: pick('.dshu-bar'),
+    fill: pick('.dshu-bar-fill'),
+    progress: pick('.dshu-plugin-progress'),
+    progressText: pick('.dshu-plugin-progress-text'),
+  }
 }
 
 function upgradeButton(): HTMLButtonElement | null {
@@ -407,6 +428,91 @@ describe('插件段', () => {
     await openPanel(document)
 
     expect(document.querySelector('.dshu-plugin-upgrade')).toBeNull()
+    closePanel()
+  })
+
+  test('running 时进度块露出来，终态后收回', async () => {
+    serve(fullRoutes())
+    await openPanel(document)
+    const row = pluginRowView('dsh-foo')
+    expect(row.progress.hidden).toBe(true)
+
+    paintBatchItem(row, {
+      name: 'dsh-foo',
+      state: 'running',
+      percent: 43,
+      detail: '正在解析依赖 ' + 'x'.repeat(120),
+      message: null,
+      unavailable: false,
+    })
+
+    expect(row.progress.hidden).toBe(false)
+    expect(row.bar.hidden).toBe(false)
+    expect(row.fill.style.width).toBe('43%')
+    // 没有状态句时 state 整行收起，进度块与版本行之间不留空缝。
+    expect(row.state.hidden).toBe(true)
+    // pnpm 的整行输出压成一句，行高不会忽上忽下。
+    expect((row.progressText.textContent ?? '').length).toBe(90)
+
+    paintBatchItem(row, {
+      name: 'dsh-foo',
+      state: 'succeeded',
+      percent: null,
+      detail: null,
+      message: null,
+      unavailable: false,
+    })
+
+    expect(row.progress.hidden).toBe(true)
+    expect(row.bar.hidden).toBe(true)
+    expect(row.state.hidden).toBe(false)
+    expect(row.state.textContent).toBe('已升级')
+    closePanel()
+  })
+
+  test('排队卡住只说「还没开始升级」，不补前缀、不上红字', async () => {
+    serve(fullRoutes())
+    await openPanel(document)
+    const row = pluginRowView('dsh-foo')
+    const message = '还没开始升级：等 2 个运行中的会话结束后再点'
+
+    paintBatchItem(row, {
+      name: 'dsh-foo',
+      state: 'failed',
+      percent: null,
+      detail: null,
+      message,
+      unavailable: false,
+    })
+
+    expect(row.state.textContent).toBe(message)
+    expect(row.state.textContent ?? '').not.toContain('升级失败：')
+    expect(row.state.hasAttribute('data-error')).toBe(false)
+    expect(row.progress.hidden).toBe(true)
+    closePanel()
+  })
+
+  test('回滚文案只留中文首句，title 里保留英文全文', async () => {
+    serve(fullRoutes())
+    await openPanel(document)
+    const row = pluginRowView('dsh-foo')
+    const zh = '装完版本对不上，已经换回旧版本，请稍后再试。'
+    const en = 'The installed version does not match; rolled back to the previous version.'
+
+    paintBatchItem(row, {
+      name: 'dsh-foo',
+      state: 'failed',
+      percent: null,
+      detail: null,
+      message: '已回滚：' + zh + ' / ' + en,
+      unavailable: false,
+    })
+
+    const shown = row.state.textContent ?? ''
+    expect(shown.startsWith('已回滚：')).toBe(true)
+    expect(shown).not.toContain('The installed version')
+    expect(shown).not.toContain('升级失败：')
+    expect(row.state.getAttribute('title')).toContain(en)
     closePanel()
   })
 })
