@@ -3,4 +3,4 @@
 只追加，不整理。一条一行：什么情况下会踩 → 为什么 → 怎么绕。
 整理过的坑会失真，宁可粗糙也别汇总成「注意事项」。
 
-> ⚠️ 待补全：第一条坑 —— 要补成一行「现象 → 原因 → 做法」（例：`升级后端口被占 → 旧进程没退干净 → 先杀进程再起`）；补在：本行下面追加一条
+- 升级到 `@deepseek-ai/dsh@0.2.3-alpha.2` 后 `dsh web` 起不来（npm 装得上，进程启动即退） → 该版本 `engines.node` 是 `^24.22.3 || >=26.13.1`，本机 node v26.7.0 落在空档里，npm 只告警不拦；0.2.2-rc.5 的 `>=24.9.0` 则满足 → 升级前必须用目标版本 manifest 的 `engines.node` 先校验（`src/server/upgrade.ts` 在备份之前调 `satisfiesNodeRange`，失败文案由 `src/server/versions.ts` 的 `describeEnginesFailure` 生成），不满足就停在 precheck，别装。
