@@ -177,7 +177,7 @@ git commit -m "refactor(client): 插件行改两行式，删掉单包升级路�
 
 在 `test/panel.test.ts` 加 7 个用例（用例 1-4 用真实 DOM 驱动，市场侧用 `fakeFetch` 桩成「POST 立刻 202、GET operations 第 N 次返回 succeeded」）：
 
-1. `插件段有一个全部升级按钮，可更新的包有两个时点一次就把两个都升了`：断言 `.dshu-upgrade-all` 存在、文案「全部升级」；点击后对 `POST /dsh-market/api/v1/updates` 依次收到两个包名。
+1. `全部升级按钮与「插件（N 个可更新）」标题同一行`：断言 `.dshu-upgrade-all` 存在、文案「全部升级」，且 `button.parentElement` 就是包含 `.dshu-plugin-head` 的那个 `.dshu-plugins-head`、`document.querySelector('.dshu-plugin-list')` 不是按钮的兄弟之一；点击后对 `POST /dsh-market/api/v1/updates` 依次收到两个包名。
 2. `升级中按钮禁用且文案变化，结束恢复`：让第一个包停在 `running`，断言按钮 `disabled === true`、文案「升级中…」；放行到全部结束后 `disabled === false`、文案回到「全部升级」。
 3. `每个插件把自己的进度画在自己那一行`：第一包 `progress.percent = 42.6` 时，`[data-name="a"] .dshu-bar-fill` 的 `style.width` 是 `'43%'`，且 `[data-name="b"] .dshu-bar` 仍 `hidden`。
 4. `中途失败继续，最后一行汇总数得清`：三个包、第二个 `failure: { code: 'INSTALL_FAILED', message: '磁盘写满' }`，断言 `[data-name="b"] .dshu-plugin-state` 有 `data-error` 且文案含「磁盘写满」、`[data-name="c"]` 最终「已升级」、`.dshu-plugin-summary` 文案含「2 个已升级」与「1 个失败」。
@@ -194,8 +194,8 @@ Expected: FAIL（`.dshu-upgrade-all` 为 null）。
 
 - [ ] **Step 3: 实现按钮与接线**
 
-- CSS 新增：`.dshu-plugins-actions{display:flex;justify-content:flex-end;gap:8px}`、`.dshu-upgrade-all{padding:6px 12px;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.12));border-radius:var(--dsw-radius-sm,6px);background:transparent;color:inherit;font:inherit;cursor:pointer}`、`.dshu-plugin-summary{font-size:12px;color:var(--dsw-alias-label-tertiary,inherit)}`；`.dshu-upgrade-all:disabled{opacity:.5;cursor:default}`。
-- `buildView`：插件段改成 `pluginsSection.append(pluginHead, pluginActions, pluginList, pluginSummary)`；`pluginActions` 是 `div.dshu-plugins-actions`，内含 `.dshu-upgrade-all`（文案「全部升级」）与 `.dshu-restart`（文案「重启 DSH」，`hidden = true`）；`pluginSummary` 是 `div.dshu-plugin-summary`，`hidden = true`。
+- `buildView`：插件段的 `h3.dshu-plugin-head`（现在 `panel.ts:495-496`）包进一行 `div.dshu-plugins-head`，同一行右侧放按钮——`pluginsSection.append(pluginsHead, pluginList, pluginSummary)`，`pluginsHead = [pluginHead, upgradeAll, restartButton]`（用户 m01298 要求按钮与「插件（N 个可更新）」标题同一行）。`.dshu-upgrade-all` 文案「全部升级」，`.dshu-restart` 文案「重启 DSH」且 `hidden = true`；`pluginSummary` 仍是列表下方的汇总行，`hidden = true`。
+- CSS 新增：`.dshu-plugins-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0}`、`.dshu-plugins-head h3{margin:0}`、`.dshu-plugins-head .dshu-upgrade-all{margin-left:auto}`、`.dshu-upgrade-all{padding:4px 10px;font-size:12px;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.12));border-radius:var(--dsw-radius-sm,6px);background:transparent;color:inherit;font:inherit;cursor:pointer}`、`.dshu-plugin-summary{font-size:12px;color:var(--dsw-alias-label-tertiary,inherit)}`；`.dshu-upgrade-all:disabled{opacity:.5;cursor:default}`。
 - `renderPlugins`：重建 `view.rows`（`rows.set(update.name, row)`）；`updatable.length === 0` 或 `!available` 时隐藏 `.dshu-upgrade-all`、清空 `rows`、隐藏 `pluginSummary`。
 - 点击处理：`startBatch(view)` —— `batchBusy = true`、`setBatchBusy(view, true)`（禁用全部升级/本体升级/重新检查/预发布，文案「升级中…」，隐藏 `pluginSummary`）、`await runBatch(names, fetchOf(doc), base, { pollIntervalMs, stalledWaitMs, cancelled: () => view.closed, onEvent })`，`onEvent` 里 `const row = view.rows.get(item.name)`，有才 `paintBatchItem(row, item)`；结束后写汇总 `n 个已升级，m 个失败`（只在 m > 0 时带失败数），`setBatchBusy(view, false)`，`live(view, token)` 为假时后面什么都不做。
 - `setBatchBusy` 与既有 `setHostBusy`/`setHostIdle` 互斥：本体忙时禁用全部升级，批量忙时禁用本体升级按钮与重查/预发布。
