@@ -13,7 +13,9 @@ fi
 
 # ② 文档里点过名的路径必须真实存在
 # 待补全标记里的例子不算「文档点了名」，跳过那些行
-for p in $(grep -rhE '(src|tests|docs|specs)/[A-Za-z0-9_./-]+' AGENTS.md docs specs 2>/dev/null | grep -v '待补全' | grep -v '例：' | grep -oE '(src|tests|docs|specs)/[A-Za-z0-9_./-]+' | sort -u); do
+# docs/superpowers/ 是冻结的历史快照（计划/设计稿），只查活文档，免得旧计划里的路径把验收钉死
+live_docs=$(find docs -type f -name '*.md' -not -path 'docs/superpowers/*' 2>/dev/null)
+for p in $(grep -rhE '(src|tests|docs|specs)/[A-Za-z0-9_./-]+' AGENTS.md $live_docs specs 2>/dev/null | grep -v '待补全' | grep -v '例：' | grep -oE '(src|tests|docs|specs)/[A-Za-z0-9_./-]+' | sort -u); do
   case "$p" in
     */) continue ;;                                   # 目录引用，不查
     *xxx*|*XXX*|*YYYY*|*NNN*|*slug*|*...*) continue ;;  # 模板里的示例路径，不查
