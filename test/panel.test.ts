@@ -206,6 +206,14 @@ async function waitFor(check: () => boolean, timeoutMs = 2000): Promise<void> {
   }
 }
 
+/** 确认重启有 800ms 冷却；正常意图要隔开两次点击。 */
+async function confirmRestart(button: HTMLButtonElement | null): Promise<void> {
+  if (button === null) return
+  button.click()
+  await new Promise((resolve) => setTimeout(resolve, 810))
+  button.click()
+}
+
 const SURVEY_UPDATE = {
   current: '0.2.2-rc.5',
   channels: { latest: '0.2.2-rc.5', next: null, alpha: '0.2.3-alpha.2' },
@@ -298,6 +306,7 @@ function textOf(selector: string): string {
 
 afterEach(() => {
   closePanel()
+  vi.useRealTimers()
   vi.unstubAllGlobals()
   for (const style of Array.from(document.querySelectorAll('style'))) style.remove()
   document.body.innerHTML = ''
@@ -907,7 +916,7 @@ describe('全部升级后的重启', () => {
     closePanel()
   })
 
-  test('点重启要二次确认；确认后同步连点只发一次预检，按钮保持禁用', async () => {
+  test('点重启要二次确认：冷却 800ms 内的连点不发请求，冷却后确认才预检', async () => {
     const streams: { precheck: ReturnType<typeof controlledStream> | null } = { precheck: null }
     const calls = serve({
       ...batchRoutes({ packages: ['a'] }),
@@ -929,18 +938,30 @@ describe('全部升级后的重启', () => {
     const button = document.querySelector<HTMLButtonElement>('.dshu-restart')
     if (button === null) throw new Error('没有重启按钮')
 
+    // 冷却判定用 Date.now，必须从第一下点击起就由假时钟接管。
+    vi.useFakeTimers()
     button.click()
-    // 第一次点击只是把危险动作摆到明面上，一个请求都不能发。
+    // 第一下：只进入确认态，一个请求都不发。
     expect(callsTo(calls, 'POST', '/dsh-restart/api/precheck')).toHaveLength(0)
     expect(button.textContent).toBe('确认重启？')
     expect(button.disabled).toBe(false)
     expect(noticeText()).toContain('再点一次')
 
-    // 同步连点：第二下确认，第三下落在同一条链里必须被挡住。
+    // 同 tick 的第二下（误双击）必须完全忽略：不改文案、不发请求。
     button.click()
+    expect(button.textContent).toBe('确认重启？')
+    expect(callsTo(calls, 'POST', '/dsh-restart/api/precheck')).toHaveLength(0)
+
+    await vi.advanceTimersByTimeAsync(799)
+    button.click()
+    expect(button.textContent).toBe('确认重启？')
+    expect(callsTo(calls, 'POST', '/dsh-restart/api/precheck')).toHaveLength(0)
+
+    await vi.advanceTimersByTimeAsync(1)
     button.click()
     expect(button.textContent).toBe('重启中…')
     expect(button.disabled).toBe(true)
+    vi.useRealTimers()
     await waitFor(() => callsTo(calls, 'POST', '/dsh-restart/api/precheck').length === 1)
     expect(callsTo(calls, 'POST', '/dsh-restart/api/precheck')).toHaveLength(1)
 
@@ -962,6 +983,34 @@ describe('全部升级后的重启', () => {
     closePanel()
   })
 
+  test('冷却窗口内被「重新检查」复位后，下一次点击仍然是第一下', async () => {
+    const calls = serve({
+      ...batchRoutes({ packages: ['a'] }),
+      'GET /dsh-restart/api/status': () => jsonResponse({ ok: true, health: true, port: 3080 }),
+    })
+    await openPanel(document, { pollIntervalMs: 10 })
+
+    document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')?.click()
+    await waitFor(() => document.querySelector<HTMLButtonElement>('.dshu-restart')?.hidden === false)
+    const button = document.querySelector<HTMLButtonElement>('.dshu-restart')
+    if (button === null) throw new Error('没有重启按钮')
+
+    vi.useFakeTimers()
+    button.click()
+    expect(button.textContent).toBe('确认重启？')
+
+    await vi.advanceTimersByTimeAsync(800)
+    document.querySelector<HTMLButtonElement>('.dshu-refresh')?.click()
+    expect(button.textContent).toBe('重启 DSH')
+
+    // 冷却已过，但确认意图已被复位：这一下仍只是第一下。
+    button.click()
+    expect(button.textContent).toBe('确认重启？')
+    expect(callsTo(calls, 'POST', '/dsh-restart/api/precheck')).toHaveLength(0)
+    vi.useRealTimers()
+    closePanel()
+  })
+
   test('预检 409 时说清「已有一轮预检在进行」，不冒充升级失败', async () => {
     const calls = serve({
       ...batchRoutes({ packages: ['a'] }),
@@ -978,8 +1027,7 @@ describe('全部升级后的重启', () => {
       return shown !== null && shown.hidden === false
     })
     const button = document.querySelector<HTMLButtonElement>('.dshu-restart')
-    button?.click()
-    button?.click()
+    await confirmRestart(button)
 
     await waitFor(() => noticeText().includes('预检失败'))
     expect(noticeText()).toContain('HTTP 409')
@@ -1005,8 +1053,7 @@ describe('全部升级后的重启', () => {
     document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')?.click()
     await waitFor(() => document.querySelector<HTMLButtonElement>('.dshu-restart')?.hidden === false)
     const button = document.querySelector<HTMLButtonElement>('.dshu-restart')
-    button?.click()
-    button?.click()
+    await confirmRestart(button)
 
     await waitFor(() => noticeText().includes('预检没有返回结果'))
     expect(noticeText()).toContain('未重启')
@@ -1027,8 +1074,7 @@ describe('全部升级后的重启', () => {
     document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')?.click()
     await waitFor(() => document.querySelector<HTMLButtonElement>('.dshu-restart')?.hidden === false)
     const button = document.querySelector<HTMLButtonElement>('.dshu-restart')
-    button?.click()
-    button?.click()
+    await confirmRestart(button)
 
     await waitFor(() => noticeText().includes('预检没有返回结果'))
     expect(textOf('.dshu-progress')).toContain('配置检查（通过）')
@@ -1052,8 +1098,7 @@ describe('全部升级后的重启', () => {
       return shown !== null && shown.hidden === false
     })
     const button = document.querySelector<HTMLButtonElement>('.dshu-restart')
-    button?.click()
-    button?.click()
+    await confirmRestart(button)
 
     await waitFor(() => noticeText().includes('预检没通过'))
     expect(noticeText()).toContain('插件兼容检查')
@@ -1107,8 +1152,7 @@ describe('全部升级后的重启', () => {
     document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')?.click()
     await waitFor(() => document.querySelector<HTMLButtonElement>('.dshu-restart')?.hidden === false)
     const button = document.querySelector<HTMLButtonElement>('.dshu-restart')
-    button?.click()
-    button?.click()
+    await confirmRestart(button)
 
     await waitFor(() => noticeText().includes('重启在进行'))
     expect(noticeText()).toContain('手动刷新')

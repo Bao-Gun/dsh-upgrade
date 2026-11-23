@@ -53,6 +53,8 @@ const UPGRADE_PATH = '/dsh-upgrade/api/upgrade'
 const RESTART_STATUS_PATH = '/dsh-restart/api/status'
 const RESTART_PRECHECK_PATH = '/dsh-restart/api/precheck'
 const RESTART_PATH = '/dsh-restart/api/restart'
+/** 确认态冷却：误双击的第二下必须落在 800ms 之外，才算第二次意图。 */
+const CONFIRM_COOLDOWN_MS = 800
 
 const HOST_HEADERS: Record<string, string> = { 'x-dsh-upgrade': '1' }
 const RESTART_HEADERS: Record<string, string> = { 'x-dsh-restart': '1' }
@@ -198,6 +200,8 @@ type View = {
   restartButton: HTMLButtonElement
   /** 第一次点「重启 DSH」只进入确认态，第二次才真的预检并重启。 */
   restartArmed: boolean
+  /** 进入确认态的时刻；冷却期内点击一律忽略，防误双击直接重启。 */
+  restartArmedAt: number | null
   /** 一条重启链在跑时挡住后续点击，避免连点叠出第二条链。 */
   restartRunning: boolean
   pluginSummary: HTMLElement
@@ -545,6 +549,7 @@ function buildView(doc: Document, options: PanelOptions): View {
     upgradeAllButton,
     restartButton,
     restartArmed: false,
+    restartArmedAt: null,
     restartRunning: false,
     pluginSummary,
     progress,
@@ -580,13 +585,17 @@ function buildView(doc: Document, options: PanelOptions): View {
   restartButton.addEventListener('click', () => {
     // 重启会直接掐断正在跑的会话：第一下只把危险摆到明面上，第二下才发请求。
     if (view.batchBusy || view.upgradeBusy || view.restartRunning || restartButton.disabled) return
+    // 冷却期内（含同 tick 的误双击）什么都不做，避免第二下立即重启。
+    if (view.restartArmedAt !== null && Date.now() - view.restartArmedAt < CONFIRM_COOLDOWN_MS) return
     if (!view.restartArmed) {
       view.restartArmed = true
+      view.restartArmedAt = Date.now()
       restartButton.textContent = '确认重启？'
       setNotice(view, '重启会中断当前会话；再点一次「确认重启？」继续')
       return
     }
     view.restartArmed = false
+    view.restartArmedAt = null
     // 同步连点也在这一刻被挡住：一次确认只允许启动一条链。
     view.restartRunning = true
     restartButton.textContent = '重启中…'
@@ -698,6 +707,7 @@ function setNotice(view: View, text: string): void {
 
 /** 面板重查或开始本体升级时，没确认完的重启意图作废，免得更晚一次点击直接重启。 */
 function disarmRestart(view: View): void {
+  view.restartArmedAt = null
   if (!view.restartArmed) return
   view.restartArmed = false
   view.restartButton.textContent = '重启 DSH'
@@ -1115,8 +1125,7 @@ async function startBatch(view: View): Promise<void> {
   // 上一轮露出来的重启入口先收回去；这一轮跑完再按 dsh-restart 的可用性决定。
   view.restartButton.hidden = true
   view.restartButton.disabled = false
-  view.restartButton.textContent = '重启 DSH'
-  view.restartArmed = false
+  disarmRestart(view)
 
   let summary: BatchSummary
   try {
