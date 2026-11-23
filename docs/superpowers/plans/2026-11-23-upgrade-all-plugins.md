@@ -122,7 +122,7 @@ git commit -m "feat(client): 串行批量升级队列（顺序、失败继续、
 **Interfaces:**
 - Consumes: `runBatch` 在 Task 1 产出的 `BatchItem` 类型；`DEFAULT_POLL_INTERVAL_MS`、`DEFAULT_STALLED_WAIT_MS` 从 `./batch` 导出。
 - Produces:
-  - `type PluginRowView = { root: HTMLElement; name: HTMLElement; version: HTMLElement; state: HTMLElement; bar: HTMLElement; fill: HTMLElement; progressText: HTMLElement }`（**没有 button 字段**）
+  - `type PluginRowView = { root: HTMLElement; name: HTMLElement; version: HTMLElement; state: HTMLElement; progress: HTMLElement; bar: HTMLElement; fill: HTMLElement; progressText: HTMLElement }`（**没有 button 字段**；`progress` 是整块进度容器，R41：`setRowProgress` 必须切它的 `hidden`，只切 bar 会让进度永远不可见）
   - `function paintBatchItem(row: PluginRowView, item: BatchItem): void`（用例在 Task 3）—— 把 `BatchItem` 画到这一行：`running` 时按 `percent` 画条（null → 不确定进度）并把 `message ?? detail ?? '正在升级…N%'` 写进 `progressText`（R36：批量层把「等 N 个运行中的会话结束」放在 message 里）；终态文案不重复加前缀（R38：message 已是完整句子——以「升级失败」「已」开头或等于「插件更新不可用」——就直接显示，只有纯原因才加「升级失败：」）；`succeeded` 收起条写「已升级」（`restartRequired` 由批量层决定是否改文案，这里只画行内终态）；`failed` 且 `unavailable` 写「插件更新不可用」（不红）；`failed` 且非 unavailable 写「升级失败：」+ 压缩后的 message（红字 + `title` 存全文）；`pending` 收起进度条清空文字。
 
 - [ ] **Step 1: 写失败测试**
