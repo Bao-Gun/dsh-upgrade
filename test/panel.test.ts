@@ -381,194 +381,32 @@ describe('插件段', () => {
     closePanel()
   })
 
-  test('插件升级请求层失败按 code 显示「插件更新不可用」，不冒充安装失败', async () => {
-    serve({
-      ...fullRoutes(),
-      'POST /dsh-market/api/v1/updates': () => jsonResponse({}, 500),
-    })
+  test('插件行是两行结构：第一行名字与版本，第二行自己的进度', async () => {
+    serve(fullRoutes())
+    await openPanel(document)
 
-    await openPanel(document, { pollIntervalMs: 1 })
-    document.querySelector<HTMLButtonElement>('.dshu-plugin-upgrade')?.click()
-
-    await waitFor(() => (pluginsSection()?.textContent ?? '').includes('插件更新不可用'))
-    expect(errorBar()?.textContent ?? '').not.toContain('插件更新不可用')
-    expect(pluginsSection()?.textContent).not.toContain('安装失败')
-
-    closePanel()
-  })
-
-  test('插件升级真失败时把宿主 message 写在这一行，不写底部红条', async () => {
-    let polls = 0
-    serve({
-      ...fullRoutes(),
-      'POST /dsh-market/api/v1/updates': () => jsonResponse({ schema: 1, operation: { operationId: 'op-1' } }),
-      'GET /dsh-market/api/v1/operations': () => {
-        polls += 1
-        if (polls === 1) return jsonResponse({ operation: { state: 'running', operationId: 'op-1' } })
-        return jsonResponse({
-          operation: {
-            state: 'failed',
-            operationId: 'op-1',
-            failure: { code: 'INSTALL_FAILED', message: '磁盘写满，插件安装失败', retryable: true },
-          },
-        })
-      },
-    })
-
-    await openPanel(document, { pollIntervalMs: 1 })
-    document.querySelector<HTMLButtonElement>('.dshu-plugin-upgrade')?.click()
-
-    // 七个插件一起升时，底部一条红条认不出是谁失败；原因必须落在这一行里。
-    await waitFor(() => (pluginsSection()?.textContent ?? '').includes('磁盘写满'))
     const row = document.querySelector('.dshu-plugin')
-    expect(row?.textContent).toContain('升级失败：磁盘写满，插件安装失败')
-    expect(row?.querySelector('.dshu-plugin-state')?.hasAttribute('data-error')).toBe(true)
-    expect(errorBar()).toBeNull()
+    expect(row).not.toBeNull()
+    const line = row?.querySelector('.dshu-plugin-line')
+    expect(line).not.toBeNull()
+    expect(line?.querySelector('.dshu-plugin-name')?.textContent).toBe('dsh-foo')
+    const version = line?.querySelector('.dshu-plugin-version')?.textContent ?? ''
+    expect(version).toContain('1.5.0')
+    expect(version).toContain('1.7.2')
 
+    // 第二行是自己的进度：进度块是行的最后一个直接子节点，默认收起。
+    const progress = row?.querySelector('.dshu-plugin-progress')
+    expect(progress).not.toBeNull()
+    expect(row?.lastElementChild).toBe(progress)
+    expect((progress as HTMLElement | null)?.hidden).toBe(true)
     closePanel()
   })
 
-  test('插件失败原因是中英双语长文时，行里只留中文首句，全文进 title', async () => {
-    const zh =
-      '有 agent 正在运行（session-a, session-b）。更新会直接替换插件文件，正在工作的 agent 可能在执行中途读到缺失或新版本的文件而报错；请等它完成或取消后再更新。'
-    const en =
-      'Agents are running (session-a, session-b). Updating replaces plugin files in place, so a working agent can fail or mix versions mid-turn; wait for it to finish (or cancel it) before updating.'
-    serve({
-      ...fullRoutes(),
-      'POST /dsh-market/api/v1/updates': () => jsonResponse({ schema: 1, operation: { operationId: 'op-1' } }),
-      'GET /dsh-market/api/v1/operations': () =>
-        jsonResponse({
-          operation: {
-            state: 'failed',
-            operationId: 'op-1',
-            failure: { code: 'AGENTS_RUNNING', message: zh + ' / ' + en, retryable: true },
-          },
-        }),
-    })
+  test('插件行不再自带升级按钮', async () => {
+    serve(fullRoutes())
+    await openPanel(document)
 
-    await openPanel(document, { pollIntervalMs: 1 })
-    document.querySelector<HTMLButtonElement>('.dshu-plugin-upgrade')?.click()
-
-    await waitFor(() => (pluginsSection()?.textContent ?? '').includes('有 agent 正在运行'))
-    const state = document.querySelector('.dshu-plugin .dshu-plugin-state')
-    const shown = state?.textContent ?? ''
-    expect(shown.startsWith('升级失败：有 agent 正在运行')).toBe(true)
-    expect(shown).not.toContain('Agents are running')
-    expect(shown.length).toBeLessThan(130)
-    expect(state?.getAttribute('title')).toContain('Agents are running')
-
-    closePanel()
-  })
-
-  test('排队等会话结束且一直没推进时解锁按钮，并说清还没开始', async () => {
-    serve({
-      ...fullRoutes(),
-      'POST /dsh-market/api/v1/updates': () => jsonResponse({ schema: 1, operation: { operationId: 'op-1' } }),
-      'GET /dsh-market/api/v1/operations': () =>
-        jsonResponse({
-          operation: {
-            state: 'queued',
-            operationId: 'op-1',
-            wait: { code: 'AGENTS_ACTIVE', message: null, activeAgentIds: ['session-a', 'session-b'] },
-          },
-        }),
-    })
-
-    await openPanel(document, { pollIntervalMs: 1, stalledWaitMs: 0 })
-    const button = document.querySelector<HTMLButtonElement>('.dshu-plugin-upgrade')
-    button?.click()
-
-    await waitFor(() => (pluginsSection()?.textContent ?? '').includes('还没开始升级'))
-    const row = document.querySelector('.dshu-plugin')
-    expect(row?.textContent).toContain('等 2 个运行中的会话结束后再点')
-    // 卡住时必须解锁，否则按钮灰着又没人在装，用户只能刷新页面。
-    expect(button?.disabled).toBe(false)
-    expect(row?.querySelector('.dshu-plugin-state')?.hasAttribute('data-error')).toBe(false)
-    expect(row?.querySelector<HTMLElement>('.dshu-bar')?.hidden).toBe(true)
-
-    closePanel()
-  })
-
-  test('进度一直在动时不会误判成卡住', async () => {
-    let polls = 0
-    serve({
-      ...fullRoutes(),
-      'POST /dsh-market/api/v1/updates': () => jsonResponse({ schema: 1, operation: { operationId: 'op-1' } }),
-      'GET /dsh-market/api/v1/operations': () => {
-        polls += 1
-        if (polls === 1) {
-          return jsonResponse({ operation: { state: 'running', operationId: 'op-1', progress: { done: 1, total: 4 } } })
-        }
-        if (polls === 2) {
-          return jsonResponse({ operation: { state: 'running', operationId: 'op-1', progress: { done: 3, total: 4 } } })
-        }
-        return jsonResponse({ operation: { state: 'succeeded', operationId: 'op-1' } })
-      },
-    })
-
-    await openPanel(document, { pollIntervalMs: 1, stalledWaitMs: 0 })
-    const button = document.querySelector<HTMLButtonElement>('.dshu-plugin-upgrade')
-    button?.click()
-
-    await waitFor(() => (pluginsSection()?.textContent ?? '').includes('已升级'))
-    expect(button?.disabled).toBe(false)
-
-    closePanel()
-  })
-
-  test('插件回滚也写在这一行，并明确说了已回滚', async () => {
-    serve({
-      ...fullRoutes(),
-      'POST /dsh-market/api/v1/updates': () => jsonResponse({ schema: 1, operation: { operationId: 'op-1' } }),
-      'GET /dsh-market/api/v1/operations': () =>
-        jsonResponse({
-          operation: {
-            state: 'rolled-back',
-            operationId: 'op-1',
-            failure: { code: 'VERSION_MISMATCH', message: '装完版本对不上', retryable: false },
-          },
-        }),
-    })
-
-    await openPanel(document, { pollIntervalMs: 1 })
-    document.querySelector<HTMLButtonElement>('.dshu-plugin-upgrade')?.click()
-
-    await waitFor(() => (pluginsSection()?.textContent ?? '').includes('已回滚'))
-    expect(pluginsSection()?.textContent).toContain('升级失败，已回滚：装完版本对不上')
-    expect(errorBar()).toBeNull()
-
-    closePanel()
-  })
-
-  test('插件运行中把 pnpm 的进度画在这一行的进度条上', async () => {
-    let polls = 0
-    serve({
-      ...fullRoutes(),
-      'POST /dsh-market/api/v1/updates': () => jsonResponse({ schema: 1, operation: { operationId: 'op-1' } }),
-      'GET /dsh-market/api/v1/operations': () => {
-        polls += 1
-        if (polls === 1) {
-          return jsonResponse({
-            operation: {
-              state: 'running',
-              operationId: 'op-1',
-              progress: { percent: 42.6, detail: '正在解析依赖', phase: 'resolving' },
-            },
-          })
-        }
-        return jsonResponse({ operation: { state: 'running', operationId: 'op-1' } })
-      },
-    })
-
-    await openPanel(document, { pollIntervalMs: 50 })
-    document.querySelector<HTMLButtonElement>('.dshu-plugin-upgrade')?.click()
-
-    await waitFor(() => (pluginsSection()?.textContent ?? '').includes('正在解析依赖'))
-    const bar = document.querySelector<HTMLElement>('.dshu-plugin .dshu-bar')
-    expect(bar?.hidden).toBe(false)
-    // 42.6 取整成 43：宽度只写整数百分比，免得 style 里出现小数。
-    expect(document.querySelector<HTMLElement>('.dshu-plugin .dshu-bar-fill')?.style.width).toBe('43%')
-
+    expect(document.querySelector('.dshu-plugin-upgrade')).toBeNull()
     closePanel()
   })
 })

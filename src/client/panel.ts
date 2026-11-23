@@ -12,14 +12,12 @@
  */
 
 import {
-  fetchPluginUpdates,
-  isPluginUnavailableCode,
-  pollPluginOperation,
-  startPluginUpdate,
-  type PluginOperation,
-  type PluginUpdate,
-  type PluginUpdates,
-} from './market'
+  DEFAULT_POLL_INTERVAL_MS,
+  DEFAULT_STALLED_WAIT_MS,
+  MAX_POLLS,
+  type BatchItem,
+} from './batch'
+import { fetchPluginUpdates, type PluginUpdate, type PluginUpdates } from './market'
 
 export type PanelState = {
   hasUpdate: boolean
@@ -66,11 +64,6 @@ const RESTART_STAGE_LABELS: Record<string, string> = {
 }
 
 const RELEASE_PAGE = 'https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v'
-const DEFAULT_POLL_INTERVAL_MS = 800
-/** 一轮升级最多盯这么久（约 20 分钟），防止流断在半路时无限轮询。 */
-const MAX_POLLS = 1500
-/** 默认 3 分钟没推进就解锁：pnpm 会不停报进度，真卡住的多半是在等会话结束。 */
-const DEFAULT_STALLED_WAIT_MS = 180_000
 
 const PHASE_LABELS: Record<string, string> = {
   backup: '备份',
@@ -108,9 +101,9 @@ const STYLE_TEXT = [
   '.dshu-row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}',
   '.dshu-toggle{display:inline-flex;align-items:center;gap:6px;color:var(--dsw-alias-label-secondary,inherit);cursor:pointer}',
   '.dshu-toggle input{accent-color:var(--dsw-alias-state-business-primary,#4d6bfe)}',
-  '.dshu-refresh,.dshu-upgrade-btn,.dshu-plugin-upgrade,.dshu-release-toggle{padding:6px 12px;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.12));border-radius:var(--dsw-radius-sm,6px);background:transparent;color:inherit;font:inherit;cursor:pointer}',
+  '.dshu-refresh,.dshu-upgrade-btn,.dshu-release-toggle{padding:6px 12px;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.12));border-radius:var(--dsw-radius-sm,6px);background:transparent;color:inherit;font:inherit;cursor:pointer}',
   '.dshu-upgrade-btn{background:var(--dsw-alias-state-business-primary,#4d6bfe);border-color:transparent;color:#fff;font-weight:600}',
-  '.dshu-upgrade-btn:disabled,.dshu-plugin-upgrade:disabled{opacity:.55;cursor:not-allowed}',
+  '.dshu-upgrade-btn:disabled{opacity:.55;cursor:not-allowed}',
   '.dshu-upgrade-btn[data-blocked]{background:transparent;border-color:var(--dsw-alias-border-l2,rgba(0,0,0,.12));color:var(--dsw-alias-label-secondary,inherit);font-weight:400}',
   '.dshu-release{display:flex;flex-direction:column;gap:8px}',
   '.dshu-release[hidden]{display:none}',
@@ -122,15 +115,18 @@ const STYLE_TEXT = [
   '.dshu-release-link{color:var(--dsw-alias-state-business-primary,#4d6bfe);text-decoration:none;font-size:13px}',
   '.dshu-release-hint{display:flex;gap:8px;align-items:center;color:var(--dsw-alias-label-secondary,inherit)}',
   '.dshu-plugin-list{display:flex;flex-direction:column;gap:8px}',
-  '.dshu-plugin{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 10px;padding:10px;border-radius:var(--dsw-radius-sm,6px);background:var(--dsw-alias-bg-layer-2,rgba(0,0,0,.03))}',
+  '.dshu-plugin{display:flex;flex-direction:column;gap:4px;padding:10px;border-radius:var(--dsw-radius-sm,6px);background:var(--dsw-alias-bg-layer-2,rgba(0,0,0,.03))}',
+  '.dshu-plugin-line{display:flex;justify-content:space-between;gap:10px;align-items:baseline}',
   '.dshu-plugin-name{font-weight:600;overflow:hidden;text-overflow:ellipsis}',
   '.dshu-plugin-version{color:var(--dsw-alias-label-secondary,inherit);font-variant-numeric:tabular-nums}',
-  '.dshu-plugin-state{grid-column:1/2;font-size:12px;color:var(--dsw-alias-label-tertiary,inherit)}',
-  '.dshu-plugin-upgrade{grid-row:1/3;grid-column:2/3;align-self:center}',
+  '.dshu-plugin-state{font-size:12px;color:var(--dsw-alias-label-tertiary,inherit)}',
+  '.dshu-plugin-progress{display:flex;flex-direction:column;gap:4px}',
+  '.dshu-plugin-progress[hidden]{display:none}',
+  '.dshu-plugin-progress-text{font-size:12px;color:var(--dsw-alias-label-tertiary,inherit)}',
   '.dshu-plugin-empty,.dshu-plugin-unavailable{color:var(--dsw-alias-label-secondary,inherit)}',
   '.dshu-plugin-state[data-error]{color:var(--dsw-alias-state-error-primary,#e5484d)}',
   // 进度条：有百分比就定宽，没有就左右来回跑（pnpm 还没给总量）。
-  '.dshu-bar{grid-column:1/3;height:4px;border-radius:2px;background:var(--dsw-alias-border-l2,rgba(0,0,0,.1));overflow:hidden}',
+  '.dshu-bar{height:4px;border-radius:2px;background:var(--dsw-alias-border-l2,rgba(0,0,0,.1));overflow:hidden}',
   '.dshu-bar[hidden]{display:none}',
   '.dshu-bar-fill{height:100%;width:0;background:var(--dsw-alias-state-business-primary,#4d6bfe);transition:width .25s ease}',
   '.dshu-bar[data-indeterminate] .dshu-bar-fill{width:38%;animation:dshu-slide 1.1s ease-in-out infinite}',
@@ -359,12 +355,6 @@ function failureTextOf(event: Record<string, unknown>): string {
   if (event.error !== undefined && event.error !== null) return errorTextOf(event.error)
   const message = asString(event.message)
   return message !== '' ? message : '升级失败'
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms)
-  })
 }
 
 async function readJsonBody(response: Response): Promise<unknown> {
@@ -836,30 +826,37 @@ function renderPlugins(view: View): void {
 /** 一行插件需要的全部节点：状态与失败原因都写在这一行里，不往面板底部抛。 */
 type PluginRowView = {
   root: HTMLElement
+  name: HTMLElement
+  version: HTMLElement
   state: HTMLElement
   bar: HTMLElement
   fill: HTMLElement
-  button: HTMLButtonElement
+  progressText: HTMLElement
 }
 
+/**
+ * 两行式：第一行名字与版本对，第二行是这一行自己的状态与进度。
+ * 不在行内放升级入口——升级由面板顶部的一个「全部升级」串行驱动。
+ */
 function createPluginRow(view: View, update: PluginUpdate): PluginRowView {
   const doc = view.doc
   const root = element(doc, 'div', 'dshu-plugin')
-  root.setAttribute('data-name', update.name)
+  root.dataset.name = update.name
+  const line = element(doc, 'div', 'dshu-plugin-line')
   const name = element(doc, 'div', 'dshu-plugin-name', update.name)
   const version = element(doc, 'div', 'dshu-plugin-version', update.from + ' → ' + update.to)
+  line.append(name, version)
   const state = element(doc, 'div', 'dshu-plugin-state')
+  const progress = element(doc, 'div', 'dshu-plugin-progress')
+  progress.hidden = true
   const bar = element(doc, 'div', 'dshu-bar')
   bar.hidden = true
   const fill = element(doc, 'div', 'dshu-bar-fill')
   bar.appendChild(fill)
-  const button = buttonOf(doc, 'dshu-plugin-upgrade', '升级')
-  const row: PluginRowView = { root, state, bar, fill, button }
-  button.addEventListener('click', () => {
-    void runPluginUpdate(view, update, row)
-  })
-  root.append(name, version, state, bar, button)
-  return row
+  const progressText = element(doc, 'div', 'dshu-plugin-progress-text')
+  progress.append(bar, progressText)
+  root.append(line, state, progress)
+  return { root, name, version, state, bar, fill, progressText }
 }
 
 /** 行内状态：失败用红字，并且清掉上一轮的进度条。 */
@@ -897,6 +894,56 @@ function setRowProgress(row: PluginRowView, percent: number | null, visible: boo
   }
   row.bar.removeAttribute('data-indeterminate')
   row.fill.style.width = String(percent) + '%'
+}
+
+/**
+ * 把一个 BatchItem 画到它自己那一行。
+ *
+ * 这里只做两件事：把 pnpm 的长 output 压成一句、给真失败上红字。
+ * message 与 unavailable 由批量层判定；请求层不可用不是安装失败，不红。
+ */
+function paintBatchItem(row: PluginRowView, item: BatchItem): void {
+  switch (item.state) {
+    case 'pending':
+      setRowState(row, '')
+      row.progressText.textContent = ''
+      setRowProgress(row, null, false)
+      return
+    case 'running': {
+      const percent = item.percent
+      // 状态行放批量层给的短句（排队时是「等 N 个运行中的会话结束」），进度文字放 pnpm 的原话。
+      setRowState(row, item.message ?? '正在升级…')
+      row.progressText.textContent =
+        item.detail !== null
+          ? item.detail
+          : percent !== null
+            ? '正在升级…' + String(percent) + '%'
+            : '正在升级…'
+      setRowProgress(row, percent, true)
+      return
+    }
+    case 'succeeded':
+      setRowState(row, '已升级')
+      row.progressText.textContent = ''
+      setRowProgress(row, null, false)
+      return
+    case 'failed': {
+      row.progressText.textContent = ''
+      setRowProgress(row, null, false)
+      if (item.unavailable) {
+        setRowState(row, item.message ?? '插件更新不可用')
+        return
+      }
+      const message = item.message
+      setRowState(
+        row,
+        message !== null && message !== '' ? '升级失败：' + compactReason(message) : '升级失败',
+        true,
+        message ?? undefined,
+      )
+      return
+    }
+  }
 }
 
 async function loadHost(
@@ -1175,173 +1222,6 @@ async function continueToRestart(view: View, token: number, target: string): Pro
     return
   }
   setNotice(view, '已升级到 ' + target + '，正在重启…')
-}
-
-async function runPluginUpdate(
-  view: View,
-  update: PluginUpdate,
-  row: PluginRowView,
-): Promise<void> {
-  const token = view.token
-  row.button.disabled = true
-  setRowState(row, '正在升级…')
-  setRowProgress(row, null, true)
-  try {
-    const f = fetchOf(view.doc)
-    const base = view.options.apiBase ?? ''
-    const started = await startPluginUpdate(update.name, f, base)
-    if (!live(view, token)) return
-    if (started.operationId === '') {
-      handlePluginStartFailure(row, started.code, started.message)
-      row.button.disabled = false
-      return
-    }
-
-    const interval = view.options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS
-    const stalledWaitMs = view.options.stalledWaitMs ?? DEFAULT_STALLED_WAIT_MS
-    let lastMove = ''
-    let movedAt = Date.now()
-    for (let round = 0; round < MAX_POLLS; round += 1) {
-      const operation = await pollPluginOperation(started.operationId, f, base)
-      if (!live(view, token)) return
-      if (operation.status === 'queued' || operation.status === 'running') {
-        const move = moveKey(operation)
-        if (move !== lastMove) {
-          lastMove = move
-          movedAt = Date.now()
-        } else if (Date.now() - movedAt >= stalledWaitMs) {
-          // 卡在「等会话结束」这类前进不了的地方：解锁按钮，把原因留在这一行。
-          setRowState(row, stalledReason(operation))
-          setRowProgress(row, null, false)
-          row.button.disabled = false
-          return
-        }
-        paintPluginRunning(row, operation)
-        await sleep(interval)
-        if (!live(view, token)) return
-        continue
-      }
-      handlePluginOperation(row, operation)
-      row.button.disabled = false
-      return
-    }
-    setRowState(row, '升级超时，稍后重试', true)
-    setRowProgress(row, null, false)
-    row.button.disabled = false
-  } catch {
-    if (!live(view, token)) return
-    setRowState(row, '插件升级请求失败，请稍后重试', true)
-    setRowProgress(row, null, false)
-    row.button.disabled = false
-  }
-}
-
-/** 判定「还在动」的指纹：状态、百分比、pnpm 输出任一变化都算推进。 */
-function moveKey(operation: PluginOperation): string {
-  const progress = operation.progress
-  return [
-    operation.status,
-    String(progress?.percent ?? ''),
-    String(progress?.done ?? ''),
-    String(progress?.detail ?? ''),
-  ].join('|')
-}
-
-/** 一直没推进时留在行里的话：等会话结束和真在跑要分开说，别让人以为装了一半。 */
-function stalledReason(operation: PluginOperation): string {
-  const agents = operation.wait?.activeAgentIds.length ?? 0
-  if (operation.status === 'queued' || agents > 0) {
-    return agents > 0
-      ? '还没开始升级：等 ' + String(agents) + ' 个运行中的会话结束后再点'
-      : '还没开始升级：一直在排队，稍后再点'
-  }
-  return '升级还在后台跑，先不等了：稍后打开面板看结果'
-}
-
-/** 运行中：状态写 pnpm 给的那一句，进度条按真实百分比走。 */
-function paintPluginRunning(row: PluginRowView, operation: PluginOperation): void {
-  const progress = operation.progress
-  if (operation.status === 'queued') {
-    const wait = operation.wait
-    const waiting =
-      wait !== undefined && wait.activeAgentIds.length > 0
-        ? '排队中，等 ' + String(wait.activeAgentIds.length) + ' 个运行中的会话结束'
-        : '排队中…'
-    setRowState(row, wait !== undefined && wait.message !== null ? wait.message : waiting)
-    setRowProgress(row, null, true)
-    return
-  }
-  const detail = progress?.detail ?? null
-  const percent = progress?.percent ?? null
-  const text =
-    detail !== null
-      ? compactReason(detail)
-      : percent !== null
-        ? '正在升级…' + String(percent) + '%'
-        : '正在升级…'
-  setRowState(row, text, false, detail ?? undefined)
-  setRowProgress(row, percent, true)
-}
-
-/**
- * 请求层不可用（市场没开、登录失效、记录丢失）不算安装失败，也不写红字；
- * 真失败把宿主的原因写进这一行——七个插件一起升级时底部一条红条认不出是谁。
- */
-function handlePluginStartFailure(
-  row: PluginRowView,
-  code: string | undefined,
-  message: string | undefined,
-): void {
-  if (isPluginUnavailableCode(code)) {
-    setRowState(row, '插件更新不可用')
-    setRowProgress(row, null, false)
-    return
-  }
-  setRowState(
-    row,
-    message !== undefined && message !== '' ? '升级失败：' + compactReason(message) : '升级失败',
-    true,
-    message,
-  )
-  setRowProgress(row, null, false)
-}
-
-function handlePluginOperation(row: PluginRowView, operation: PluginOperation): void {
-  setRowProgress(row, null, false)
-  switch (operation.status) {
-    case 'succeeded':
-      setRowState(row, operation.restartRequired ? '已升级，重启 DSH 后生效' : '已升级')
-      return
-    case 'failed':
-      if (isPluginUnavailableCode(operation.code)) {
-        setRowState(row, '插件更新不可用')
-        return
-      }
-      setRowState(
-        row,
-        operation.message !== undefined && operation.message !== ''
-          ? '升级失败：' + compactReason(operation.message)
-          : '升级失败',
-        true,
-        operation.message,
-      )
-      return
-    case 'cancelled':
-      setRowState(row, '已取消')
-      return
-    case 'rolled-back':
-      setRowState(
-        row,
-        operation.message !== undefined && operation.message !== ''
-          ? '升级失败，已回滚：' + compactReason(operation.message)
-          : '升级失败，已回滚',
-        true,
-        operation.message,
-      )
-      return
-    default:
-      return
-  }
 }
 
 /**
