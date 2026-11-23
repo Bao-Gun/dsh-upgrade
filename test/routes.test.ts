@@ -288,6 +288,19 @@ describe('POST /check', () => {
     const candidates = body.candidates as Array<Record<string, unknown>>
     expect(candidates.map((candidate) => candidate.version)).toContain(TARGET)
   })
+
+  test('装完没重启时重查仍带 restartRequired，不把标记抹掉', async () => {
+    await writeLast({ lastResult: { to: CURRENT, at: NOW, restartRequired: true } })
+    const route = setup(baseDeps())(CHECK_PATH)
+    const { res, state } = fakeRes()
+
+    await route.handler(request('POST', CHECK_PATH, { body: { includePrerelease: false } }), res)
+
+    expect(state.status).toBe(200)
+    const body = jsonOf(state)
+    expect(body.restartRequired).toBe(true)
+    expect(body.target).toBe(CURRENT)
+  })
 })
 
 describe('POST /upgrade', () => {

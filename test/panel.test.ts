@@ -604,6 +604,8 @@ describe('本体升级的 NDJSON 进度', () => {
 
     await waitFor(() => noticeText().includes('需手动重启'))
     expect(noticeText()).toContain('预检')
+    // 终止事件也带 done:true，但 ok:false 时不能写「完成」打脸下面的通知。
+    expect(textOf('.dshu-progress')).not.toContain('重启预检完成')
     expect(callsTo(calls, 'POST', '/dsh-restart/api/restart')).toHaveLength(0)
 
     closePanel()
@@ -651,6 +653,29 @@ describe('刷新与预发布开关', () => {
     await waitFor(() => callsTo(calls, 'POST', '/dsh-upgrade/api/check').length === 1)
     const checks = callsTo(calls, 'POST', '/dsh-upgrade/api/check')
     expect(checks[0]?.body).toEqual({ includePrerelease: false, force: true })
+
+    closePanel()
+  })
+
+  test('装完没重启后点「重新检查」：仍是「需重启」，角标不灭', async () => {
+    const survey = { ...SURVEY_UPDATE, target: SURVEY_UPDATE.current, restartRequired: true }
+    const calls = serve({
+      ...fullRoutes(),
+      'GET /dsh-upgrade/api/status': () => jsonResponse(survey),
+      'POST /dsh-upgrade/api/check': () => jsonResponse(survey),
+    })
+    const states: Array<{ hasUpdate: boolean }> = []
+
+    await openPanel(document, { onState: (state) => states.push({ hasUpdate: state.hasUpdate }) })
+    document.querySelector<HTMLButtonElement>('.dshu-refresh')?.click()
+
+    await waitFor(() => callsTo(calls, 'POST', '/dsh-upgrade/api/check').length === 1)
+    await waitFor(() => states.length >= 2)
+    const text = hostSection()?.textContent ?? ''
+    expect(text).toContain('需重启')
+    expect(text).not.toContain('已是最新')
+    expect(states.at(-1)?.hasUpdate).toBe(true)
+    expect(upgradeButton()).toBeNull()
 
     closePanel()
   })

@@ -1024,7 +1024,8 @@ async function continueToRestart(view: View, token: number, target: string): Pro
         )
         return
       }
-      if (event.done === true) addProgress(view, '重启预检完成')
+      // 失败事件也带 done；别让进度条写「完成」而下面的通知说没通过。
+      if (event.done === true && event.ok !== false && passed) addProgress(view, '重启预检完成')
     })
   } catch {
     if (live(view, token)) manualRestart('预检读到一半断了')

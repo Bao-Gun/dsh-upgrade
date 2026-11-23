@@ -224,6 +224,7 @@ async function performUpgrade(target: string, deps: ResolvedToolDeps): Promise<U
     return { ok: false, error: result.error ?? { code: 'UPGRADE_FAILED', message: '升级失败' } }
   }
   // 装完还没重启：这个标记是页面刷新后唯一还知道该提示「需重启」的凭据。
+  // 这里不写 running：工具路径没有 NDJSON 流，面板看到 running:true 会误以为能在进度条里等它。
   await writeLast({
     lastResult: { to: target, at: Date.now(), restartRequired: true },
     lastError: undefined,

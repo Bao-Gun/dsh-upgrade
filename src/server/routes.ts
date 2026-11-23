@@ -193,7 +193,9 @@ function checkHandler(deps: ResolvedDeps): RouteHandler {
         deps.fetchRegistry({ force }),
       ])
       const survey = await surveyOf(host.version, registry.info, includePrerelease, deps)
-      respondJson(res, 200, survey)
+      // 与 status 同口径：重查不能把「装完没重启」抹成「已是最新」。
+      const restartRequired = await readRestartRequired(host.version)
+      respondJson(res, 200, { ...survey, restartRequired })
     } catch (error) {
       respondJson(res, 500, errorBodyOf(error))
     }
