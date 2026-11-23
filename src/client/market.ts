@@ -21,6 +21,33 @@ const UNAVAILABLE_MESSAGE = '插件更新不可用'
 const UNAUTHORIZED_MESSAGE = '需要先登录 DSH'
 const UNKNOWN_OPERATION_MESSAGE = '升级记录已失效，宿主可能已重启'
 
+/**
+ * R27：面板必须按 code 分流，不能看 status === 'failed'。
+ * 一次请求层抖动（MARKET_UNAVAILABLE）和一次真安装失败（宿主给的
+ * INSTALL_FAILED 之类）都是 status:'failed'，只有 code 能分开。
+ */
+export type PluginOperationCode =
+  | 'MARKET_UNAVAILABLE'
+  | 'OPERATION_UNKNOWN'
+  | 'MARKET_UNAUTHORIZED'
+  | 'UPDATE_FAILED'
+
+export const PLUGIN_MARKET_UNAVAILABLE: PluginOperationCode = 'MARKET_UNAVAILABLE'
+export const PLUGIN_OPERATION_UNKNOWN: PluginOperationCode = 'OPERATION_UNKNOWN'
+export const PLUGIN_MARKET_UNAUTHORIZED: PluginOperationCode = 'MARKET_UNAUTHORIZED'
+export const PLUGIN_UPDATE_FAILED: PluginOperationCode = 'UPDATE_FAILED'
+
+/** 这三种都不是「装挂了」，面板统一说「插件更新不可用」。 */
+const UNAVAILABLE_CODES: readonly string[] = [
+  PLUGIN_MARKET_UNAVAILABLE,
+  PLUGIN_OPERATION_UNKNOWN,
+  PLUGIN_MARKET_UNAUTHORIZED,
+]
+
+export function isPluginUnavailableCode(code: string | undefined): boolean {
+  return typeof code === 'string' && UNAVAILABLE_CODES.includes(code)
+}
+
 export type PluginUpdate = {
   name: string
   from: string
