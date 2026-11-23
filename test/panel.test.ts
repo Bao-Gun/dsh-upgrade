@@ -907,7 +907,7 @@ describe('全部升级后的重启', () => {
     closePanel()
   })
 
-  test('点重启要二次确认；确认后才预检 → 重启，按钮在请求期间禁用', async () => {
+  test('点重启要二次确认；确认后同步连点只发一次预检，按钮保持禁用', async () => {
     const streams: { precheck: ReturnType<typeof controlledStream> | null } = { precheck: null }
     const calls = serve({
       ...batchRoutes({ packages: ['a'] }),
@@ -936,9 +936,13 @@ describe('全部升级后的重启', () => {
     expect(button.disabled).toBe(false)
     expect(noticeText()).toContain('再点一次')
 
+    // 同步连点：第二下确认，第三下落在同一条链里必须被挡住。
     button.click()
-    await waitFor(() => callsTo(calls, 'POST', '/dsh-restart/api/precheck').length === 1)
+    button.click()
+    expect(button.textContent).toBe('重启中…')
     expect(button.disabled).toBe(true)
+    await waitFor(() => callsTo(calls, 'POST', '/dsh-restart/api/precheck').length === 1)
+    expect(callsTo(calls, 'POST', '/dsh-restart/api/precheck')).toHaveLength(1)
 
     const liveStream = (): ReturnType<typeof controlledStream> => {
       if (streams.precheck === null) throw new Error('预检请求还没发出去')
@@ -958,12 +962,13 @@ describe('全部升级后的重启', () => {
     closePanel()
   })
 
-  test('预检失败时不发重启请求，失败原因留在面板里', async () => {
+  test('预检 409 时说清「已有一轮预检在进行」，不冒充升级失败', async () => {
     const calls = serve({
       ...batchRoutes({ packages: ['a'] }),
       'GET /dsh-restart/api/status': () => jsonResponse({ ok: true, health: true, port: 3080 }),
       'POST /dsh-restart/api/precheck': () =>
-        jsonResponse({ code: 'PRECHECK_FAILED', message: '配置解析失败' }, 500),
+        // 真实 dsh-restart 的非 2xx 形状是 { ok:false, error }，不是 message。
+        jsonResponse({ ok: false, error: '已有一轮预检在进行' }, 409),
     })
     await openPanel(document, { pollIntervalMs: 10 })
 
@@ -977,13 +982,58 @@ describe('全部升级后的重启', () => {
     button?.click()
 
     await waitFor(() => noticeText().includes('预检失败'))
-    expect(noticeText()).toContain('配置解析失败')
+    expect(noticeText()).toContain('HTTP 409')
+    expect(noticeText()).toContain('已有一轮预检在进行')
     expect(noticeText()).not.toContain('升级失败')
     expect(callsTo(calls, 'POST', '/dsh-restart/api/restart')).toHaveLength(0)
     // 不是弹一次就消失的红条：通知留在面板里。
     expect(document.querySelector<HTMLElement>('.dshu-notice')?.hidden).toBe(false)
     await new Promise((resolve) => setTimeout(resolve, 30))
     expect(noticeText()).toContain('预检失败')
+    closePanel()
+  })
+
+  test('预检 200 但 body 为空：没拿到 done 就不重启', async () => {
+    const calls = serve({
+      ...batchRoutes({ packages: ['a'] }),
+      'GET /dsh-restart/api/status': () => jsonResponse({ ok: true, health: true, port: 3080 }),
+      'POST /dsh-restart/api/precheck': () => textResponse(''),
+      'POST /dsh-restart/api/restart': () => jsonResponse({ ok: true }, 202),
+    })
+    await openPanel(document, { pollIntervalMs: 10 })
+
+    document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')?.click()
+    await waitFor(() => document.querySelector<HTMLButtonElement>('.dshu-restart')?.hidden === false)
+    const button = document.querySelector<HTMLButtonElement>('.dshu-restart')
+    button?.click()
+    button?.click()
+
+    await waitFor(() => noticeText().includes('预检没有返回结果'))
+    expect(noticeText()).toContain('未重启')
+    expect(callsTo(calls, 'POST', '/dsh-restart/api/restart')).toHaveLength(0)
+    closePanel()
+  })
+
+  test('预检流只有半截（有 started 无 done）：当失败，不重启', async () => {
+    const calls = serve({
+      ...batchRoutes({ packages: ['a'] }),
+      'GET /dsh-restart/api/status': () => jsonResponse({ ok: true, health: true, port: 3080 }),
+      'POST /dsh-restart/api/precheck': () =>
+        textResponse('{"stage":"config","ok":true,"failures":[]}\n'),
+      'POST /dsh-restart/api/restart': () => jsonResponse({ ok: true }, 202),
+    })
+    await openPanel(document, { pollIntervalMs: 10 })
+
+    document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')?.click()
+    await waitFor(() => document.querySelector<HTMLButtonElement>('.dshu-restart')?.hidden === false)
+    const button = document.querySelector<HTMLButtonElement>('.dshu-restart')
+    button?.click()
+    button?.click()
+
+    await waitFor(() => noticeText().includes('预检没有返回结果'))
+    expect(textOf('.dshu-progress')).toContain('配置检查（通过）')
+    expect(textOf('.dshu-progress')).not.toContain('重启预检完成')
+    expect(callsTo(calls, 'POST', '/dsh-restart/api/restart')).toHaveLength(0)
     closePanel()
   })
 
@@ -1044,6 +1094,49 @@ describe('全部升级后的重启', () => {
     expect(callsTo(calls, 'POST', '/dsh-restart/api/restart')).toHaveLength(0)
     closePanel()
   })
+  test('restart 409 后把按钮恢复可点，并说明已有重启在跑', async () => {
+    const calls = serve({
+      ...batchRoutes({ packages: ['a'] }),
+      'GET /dsh-restart/api/status': () => jsonResponse({ ok: true, health: true, port: 3080 }),
+      'POST /dsh-restart/api/precheck': () =>
+        textResponse('{"stage":"boot","ok":true,"failures":[]}\n{"done":true}\n'),
+      'POST /dsh-restart/api/restart': () => jsonResponse({ ok: false, error: '已有一轮重启' }, 409),
+    })
+    await openPanel(document, { pollIntervalMs: 10 })
+
+    document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')?.click()
+    await waitFor(() => document.querySelector<HTMLButtonElement>('.dshu-restart')?.hidden === false)
+    const button = document.querySelector<HTMLButtonElement>('.dshu-restart')
+    button?.click()
+    button?.click()
+
+    await waitFor(() => noticeText().includes('重启在进行'))
+    expect(noticeText()).toContain('手动刷新')
+    expect(button?.disabled).toBe(false)
+    expect(button?.textContent).toBe('重启 DSH')
+    expect(callsTo(calls, 'POST', '/dsh-restart/api/restart')).toHaveLength(1)
+    closePanel()
+  })
+
+  test('确认态被「重新检查」复位，不会留到下一次点击', async () => {
+    const calls = serve({
+      ...batchRoutes({ packages: ['a'] }),
+      'GET /dsh-restart/api/status': () => jsonResponse({ ok: true, health: true, port: 3080 }),
+    })
+    await openPanel(document, { pollIntervalMs: 10 })
+
+    document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')?.click()
+    await waitFor(() => document.querySelector<HTMLButtonElement>('.dshu-restart')?.hidden === false)
+    const button = document.querySelector<HTMLButtonElement>('.dshu-restart')
+    button?.click()
+    expect(button?.textContent).toBe('确认重启？')
+
+    document.querySelector<HTMLButtonElement>('.dshu-refresh')?.click()
+    expect(button?.textContent).toBe('重启 DSH')
+    expect(callsTo(calls, 'POST', '/dsh-restart/api/precheck')).toHaveLength(0)
+    closePanel()
+  })
+
 })
 
 describe('面板布局：头部固定、内容区滚动', () => {

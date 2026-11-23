@@ -198,6 +198,8 @@ type View = {
   restartButton: HTMLButtonElement
   /** 第一次点「重启 DSH」只进入确认态，第二次才真的预检并重启。 */
   restartArmed: boolean
+  /** 一条重启链在跑时挡住后续点击，避免连点叠出第二条链。 */
+  restartRunning: boolean
   pluginSummary: HTMLElement
   progress: HTMLElement
   notice: HTMLElement
@@ -543,6 +545,7 @@ function buildView(doc: Document, options: PanelOptions): View {
     upgradeAllButton,
     restartButton,
     restartArmed: false,
+    restartRunning: false,
     pluginSummary,
     progress,
     notice,
@@ -576,7 +579,7 @@ function buildView(doc: Document, options: PanelOptions): View {
   })
   restartButton.addEventListener('click', () => {
     // 重启会直接掐断正在跑的会话：第一下只把危险摆到明面上，第二下才发请求。
-    if (view.batchBusy || view.upgradeBusy || restartButton.disabled) return
+    if (view.batchBusy || view.upgradeBusy || view.restartRunning || restartButton.disabled) return
     if (!view.restartArmed) {
       view.restartArmed = true
       restartButton.textContent = '确认重启？'
@@ -584,6 +587,8 @@ function buildView(doc: Document, options: PanelOptions): View {
       return
     }
     view.restartArmed = false
+    // 同步连点也在这一刻被挡住：一次确认只允许启动一条链。
+    view.restartRunning = true
     restartButton.textContent = '重启中…'
     restartButton.disabled = true
     // 插件批量没有本体升级的阶段条；清掉上一轮残留，让预检从干净的面板开始。
@@ -592,6 +597,7 @@ function buildView(doc: Document, options: PanelOptions): View {
     const token = view.token
     void runRestartChain(view, token, (reason) => {
       if (!live(view, token)) return
+      view.restartRunning = false
       restartButton.disabled = false
       restartButton.textContent = '重启 DSH'
       setNotice(view, '重启不可用：' + reason)
@@ -600,12 +606,14 @@ function buildView(doc: Document, options: PanelOptions): View {
   prerelease.addEventListener('change', () => {
     // 升级进行中重查会用旧 survey 重画，按钮忽隐忽现且点击无效果；直接按住。
     if (view.upgradeBusy || view.batchBusy) return
+    disarmRestart(view)
     const token = view.token
     view.includePrerelease = prerelease.checked
     void loadHost(view, token, { check: true, force: false })
   })
   refreshButton.addEventListener('click', () => {
     if (view.upgradeBusy || view.batchBusy) return
+    disarmRestart(view)
     const token = view.token
     view.includePrerelease = prerelease.checked
     void loadHost(view, token, { check: true, force: true })
@@ -686,6 +694,13 @@ function setNotice(view: View, text: string): void {
   }
   view.notice.hidden = false
   view.notice.textContent = text
+}
+
+/** 面板重查或开始本体升级时，没确认完的重启意图作废，免得更晚一次点击直接重启。 */
+function disarmRestart(view: View): void {
+  if (!view.restartArmed) return
+  view.restartArmed = false
+  view.restartButton.textContent = '重启 DSH'
 }
 
 function resetProgress(view: View): void {
@@ -1221,6 +1236,8 @@ async function runHostUpgrade(view: View, token: number): Promise<void> {
   const f = fetchOf(view.doc)
   const base = view.options.apiBase ?? ''
 
+  // 本体升级会自己走重启链；之前没确认的重启意图先作废。
+  disarmRestart(view)
   view.upgradeBusy = true
   if (view.upgradeButton !== null) view.upgradeButton.disabled = true
   view.prerelease.disabled = true
@@ -1337,6 +1354,28 @@ function restartFailureDetail(event: Record<string, unknown>): string {
   return label === '' ? message : label + '：' + message
 }
 
+/** 预检失败响应可能长成 {ok:false,error}、{message} 或纯文本；依次取第一句能看的。 */
+async function readFailureReason(response: Response): Promise<string> {
+  try {
+    const text = (await response.text()).trim()
+    if (text === '') return ''
+    try {
+      const parsed: unknown = JSON.parse(text)
+      if (isRecord(parsed)) {
+        const error = asString(parsed.error)
+        if (error !== '') return compactReason(error)
+        const message = asString(parsed.message)
+        if (message !== '') return compactReason(message)
+      }
+    } catch {
+      // 不是 JSON 就按纯文本用。
+    }
+    return compactReason(text)
+  } catch {
+    return ''
+  }
+}
+
 /**
  * status → precheck → restart 三步固定顺序；任何一步走不通就交给 onManual 说一句人话，
  * 预检没过时绝不发 restart。成功时按调用方给的文案提示。
@@ -1388,24 +1427,25 @@ async function runRestartChain(
   }
   if (!live(view, token)) return
   if (!precheck.ok) {
-    const body = await readJsonBody(precheck)
+    const reason = await readFailureReason(precheck)
     if (!live(view, token)) return
-    const message = isRecord(body) ? compactReason(asString(body.message)) : ''
-    onManual('预检失败（HTTP ' + precheck.status + (message === '' ? '' : '：' + message) + '）')
+    onManual('预检失败（HTTP ' + precheck.status + (reason === '' ? '' : '：' + reason) + '）')
     return
   }
 
-  let passed = true
+  // 缺证据按失败算：只有明确收到 done 才允许重启。
+  let failed = false
+  let sawDone = false
   let detail = ''
   try {
     await readNdjson(precheck, (event) => {
       if (!live(view, token)) return
       if (event.ok === false) {
-        passed = false
+        failed = true
         if (detail === '') detail = restartFailureDetail(event)
       }
       if (event.error !== undefined && event.error !== null) {
-        passed = false
+        failed = true
         if (detail === '') {
           detail = compactReason(
             isRecord(event.error) ? asString(event.error.message) : asString(event.error),
@@ -1424,16 +1464,24 @@ async function runRestartChain(
         return
       }
       // 失败事件也带 done；别让进度条写「完成」而下面的通知说没通过。
-      if (event.done === true && event.ok !== false && passed) addProgress(view, '重启预检完成')
+      if (event.done === true) {
+        sawDone = true
+        if (!failed && event.ok !== false) addProgress(view, '重启预检完成')
+      }
     })
   } catch {
     if (live(view, token)) onManual('预检读到一半断了')
     return
   }
   if (!live(view, token)) return
-  if (!passed) {
+  if (failed) {
     // 原因常驻面板，别让用户只看到一闪而过的红条就去猜哪里坏了。
     onManual('预检没通过' + (detail === '' ? '' : '：' + detail))
+    return
+  }
+  if (!sawDone) {
+    // 流被截断或服务端没跑完：没有通过证据就不重启。
+    onManual('预检没有返回结果，未重启')
     return
   }
 
@@ -1450,7 +1498,7 @@ async function runRestartChain(
   }
   if (!live(view, token)) return
   if (restart.status === 409) {
-    setNotice(view, '已经有一轮重启在进行，请稍后手动刷新页面确认')
+    onManual('已经有一轮重启在进行，请稍后手动刷新页面确认')
     return
   }
   if (!restart.ok) {
