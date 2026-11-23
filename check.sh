@@ -13,7 +13,9 @@ fi
 
 # ② 文档里点过名的路径必须真实存在
 # 待补全标记里的例子不算「文档点了名」，跳过那些行
-for p in $(grep -rhE '(src|tests|docs|specs)/[A-Za-z0-9_./-]+' AGENTS.md docs specs 2>/dev/null | grep -v '待补全' | grep -v '例：' | grep -oE '(src|tests|docs|specs)/[A-Za-z0-9_./-]+' | sort -u); do
+# docs/superpowers/ 是冻结的历史快照（计划/设计稿），只查活文档，免得旧计划里的路径把验收钉死
+live_docs=$(find docs -type f -name '*.md' -not -path 'docs/superpowers/*' 2>/dev/null)
+for p in $(grep -rhE '(src|tests|docs|specs)/[A-Za-z0-9_./-]+' AGENTS.md $live_docs specs 2>/dev/null | grep -v '待补全' | grep -v '例：' | grep -oE '(src|tests|docs|specs)/[A-Za-z0-9_./-]+' | sort -u); do
   case "$p" in
     */) continue ;;                                   # 目录引用，不查
     *xxx*|*XXX*|*YYYY*|*NNN*|*slug*|*...*) continue ;;  # 模板里的示例路径，不查
@@ -30,14 +32,10 @@ for t in specs/changes/*/tasks.md; do
   fi
 done
 
-# ④ ⚠️ 待补全：测试 / 验收命令 —— 要补成一行能跑的命令（例：`npm test`、`pytest -q`）；补在：下面三行 echo 那里
-# 换的时候删掉 echo 和 fail=1，再按注释里的样子加真命令。
-echo '⚠️ 待补全：测试 / 验收命令还没配（测试 / lint / typecheck 任一都可）' >&2
-echo '   要补成：一行能跑的命令；补在：本文件第 ④ 段' >&2
-fail=1
-# 示例（配好真命令后改用这些形状，一条挂了不挡其它条）：
-#   npm test  || bad "测试失败"
-#   npm run lint || bad "lint 失败"
+# ④ 构建 / 类型检查 / 测试，一条挂了不挡其它条
+npm run build || bad "构建失败"
+npx tsc --noEmit || bad "类型检查失败"
+npm test || bad "测试失败"
 
 if [ "$fail" -eq 0 ]; then echo '✓ 全部通过'; else echo '✗ 有未通过项' >&2; fi
 exit "$fail"

@@ -13,6 +13,8 @@
 | `docs/README.md` | `docs/` 里的命名与分文件规则 | 项目说明 |
 | `docs/superpowers/plans/` | superpowers 写的实施计划，一个功能一份（进 git） | 改过的旧计划（原件不再动） |
 | `docs/superpowers/specs/` | superpowers 写的设计稿（进 git） | 已落地的结论（搬进 `docs/architecture.md`） |
+| `scripts/` | 安装 / 运维脚本（纯 Node，不进打包） | 运行期代码 |
+| `cordis.patch.yml` | 装进 profile 的 cordis patch 片段，安装脚本原样追加 | 项目自己的配置 |
 | `.superpowers/` | superpowers 的执行工作台：进度、任务简报、评审包（自动忽略，别提交） | 任何要长期留的东西 |
 | `.work/` | 草稿、临时计划（不进 git） | 任何还要留下的东西 |
 | `check.sh` | 唯一的验收脚本 | —— |
@@ -30,19 +32,9 @@
 
 ## 命令
 
-- 启动：⚠️ 待补全：启动命令 —— 要补成一行能启动的命令（例：`npm run dev`）；补在：本行
+- 启动：`node scripts/install.mjs --apply`（先在仓库 `npm run build`；不加 `--apply` 只 dry-run）
 - 检查：`bash check.sh`（唯一判断对错的方式，别靠肉眼）。收尾要贴出退出码和结果行再说完成。
 - 并行开发：工作树放 `.worktrees/`（已在忽略列表）。有 harness 原生 worktree 工具就用它，别手搓 `git worktree`。
-
-## 现在缺什么
-
-| 缺什么 | 要补成 | 补在哪 |
-|---|---|---|
-| 启动命令 | 一行能启动的命令 | 上面「启动」那行 |
-| 测试 / 验收命令 | 一行能跑的命令（例：`npm test`、`pytest -q`） | `check.sh` 第 ④ 段 |
-| 模块表 | 每个模块一行：路径 / 职责 / 谁调用它（例：`src/upgrade.js` / 执行升级并重启 / `src/index.js`） | `docs/architecture.md`「模块」表 |
-| 数据流 | 一行：从哪进来 → 经过哪 → 存到哪 | `docs/architecture.md`「数据流」 |
-| 第一条坑 | 现象 → 原因 → 做法 | `docs/gotchas.md` |
 
 ## 维护
 

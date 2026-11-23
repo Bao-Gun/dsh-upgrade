@@ -1,0 +1,1195 @@
+/**
+ * 升级面板：本体与插件两段、更新内容折叠、升级进度（NDJSON）。
+ *
+ * 面板只负责“看见”和“发起”，不自己判断版本：目标版本、被拦原因全来自
+ * GET /dsh-upgrade/api/status；升级过程由 POST /dsh-upgrade/api/upgrade 一条
+ * NDJSON 流推进；结束之后如果页面里还装着 dsh-restart，就顺手走“预检 → 重启”，
+ * 否则降级成“已升级，需手动重启”。
+ *
+ * 所有请求都带 x-dsh-upgrade: 1（服务端的来源门要求）；dsh-restart 的两个
+ * 写端点带它自己的 x-dsh-restart: 1。面板自身不抛异常：任何失败都画成
+ * .dshu-error 红条或 .dshu-notice 提示。
+ */
+
+import {
+  fetchPluginUpdates,
+  isPluginUnavailableCode,
+  pollPluginOperation,
+  startPluginUpdate,
+  type PluginOperation,
+  type PluginUpdate,
+  type PluginUpdates,
+} from './market'
+
+export type PanelState = {
+  hasUpdate: boolean
+  busy: boolean
+}
+
+export type PanelOptions = {
+  /** origin 或部署前缀；默认同源。 */
+  apiBase?: string
+  /** 插件升级的轮询间隔（毫秒）；测试里调小。 */
+  pollIntervalMs?: number
+  /** 面板算出的底栏角标状态；没有入口时什么都不发生。 */
+  onState?(state: PanelState): void
+  /** 面板关闭后回调。 */
+  onClose?(): void
+}
+
+const PANEL_MARK = 'data-dshu-panel'
+const STYLE_ID = 'dshu-panel-style'
+
+const STATUS_PATH = '/dsh-upgrade/api/status'
+const CHECK_PATH = '/dsh-upgrade/api/check'
+const RELEASES_PATH = '/dsh-upgrade/api/releases'
+const UPGRADE_PATH = '/dsh-upgrade/api/upgrade'
+
+const RESTART_STATUS_PATH = '/dsh-restart/api/status'
+const RESTART_PRECHECK_PATH = '/dsh-restart/api/precheck'
+const RESTART_PATH = '/dsh-restart/api/restart'
+
+const HOST_HEADERS: Record<string, string> = { 'x-dsh-upgrade': '1' }
+const RESTART_HEADERS: Record<string, string> = { 'x-dsh-restart': '1' }
+
+/** dsh-restart 预检的阶段名 → 人话；未知阶段原样显示，不吞信息。 */
+const RESTART_STAGE_LABELS: Record<string, string> = {
+  config: '配置检查',
+  compat: '插件兼容检查',
+  boot: '启动冒烟检查',
+}
+
+const RELEASE_PAGE = 'https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v'
+const DEFAULT_POLL_INTERVAL_MS = 800
+/** 一轮升级最多盯这么久（约 20 分钟），防止流断在半路时无限轮询。 */
+const MAX_POLLS = 1500
+
+const PHASE_LABELS: Record<string, string> = {
+  backup: '备份',
+  precheck: '预检',
+  install: '安装',
+  verify: '校验',
+  restart: '重启',
+  done: '完成',
+  fail: '失败',
+  rollback: '回滚',
+}
+
+const STYLE_TEXT = [
+  '.dshu-overlay{position:fixed;inset:0;z-index:2147483000;display:flex;align-items:center;justify-content:center;padding:24px;background:rgba(0,0,0,.32)}',
+  '.dshu-panel{position:relative;display:flex;flex-direction:column;gap:14px;width:min(560px,100%);max-height:min(80vh,720px);overflow:auto;padding:20px;border-radius:var(--dsw-radius-lg,12px);background:var(--dsw-alias-bg-layer-1,var(--dsw-alias-bg-primary,#fff));color:var(--dsw-alias-label-primary,inherit);box-shadow:0 18px 48px rgba(0,0,0,.24);font:14px/1.55 var(--dsw-font-family,system-ui,sans-serif)}',
+  '.dshu-head{display:flex;align-items:center;justify-content:space-between;gap:12px}',
+  '.dshu-title{font-size:16px;font-weight:600}',
+  '.dshu-close{flex:none;width:28px;height:28px;border:none;border-radius:var(--dsw-radius-sm,6px);background:transparent;color:inherit;font-size:18px;line-height:1;cursor:pointer}',
+  '.dshu-close:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.06))}',
+  '.dshu-section{display:flex;flex-direction:column;gap:10px;padding:14px;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.08));border-radius:var(--dsw-radius-md,8px)}',
+  '.dshu-section h3{margin:0;font-size:14px;font-weight:600}',
+  '.dshu-versions{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px}',
+  '.dshu-version{font-variant-numeric:tabular-nums}',
+  '.dshu-current{color:var(--dsw-alias-label-secondary,inherit)}',
+  '.dshu-arrow{color:var(--dsw-alias-label-tertiary,inherit)}',
+  '.dshu-target{font-weight:600;color:var(--dsw-alias-state-business-primary,#4d6bfe)}',
+  '.dshu-channel{margin-left:4px;color:var(--dsw-alias-label-tertiary,inherit)}',
+  '.dshu-row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}',
+  '.dshu-toggle{display:inline-flex;align-items:center;gap:6px;color:var(--dsw-alias-label-secondary,inherit);cursor:pointer}',
+  '.dshu-toggle input{accent-color:var(--dsw-alias-state-business-primary,#4d6bfe)}',
+  '.dshu-refresh,.dshu-upgrade-btn,.dshu-plugin-upgrade,.dshu-release-toggle{padding:6px 12px;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.12));border-radius:var(--dsw-radius-sm,6px);background:transparent;color:inherit;font:inherit;cursor:pointer}',
+  '.dshu-upgrade-btn{background:var(--dsw-alias-state-business-primary,#4d6bfe);border-color:transparent;color:#fff;font-weight:600}',
+  '.dshu-upgrade-btn:disabled,.dshu-plugin-upgrade:disabled{opacity:.55;cursor:not-allowed}',
+  '.dshu-upgrade-btn[data-blocked]{background:transparent;border-color:var(--dsw-alias-border-l2,rgba(0,0,0,.12));color:var(--dsw-alias-label-secondary,inherit);font-weight:400}',
+  '.dshu-release{display:flex;flex-direction:column;gap:8px}',
+  '.dshu-release[hidden]{display:none}',
+  '.dshu-release-row{display:flex;flex-direction:column;gap:6px}',
+  '.dshu-release-toggle{align-self:flex-start;font-weight:600}',
+  '.dshu-release-body{padding-left:10px;border-left:2px solid var(--dsw-alias-border-l2,rgba(0,0,0,.08))}',
+  '.dshu-release-body[hidden]{display:none}',
+  '.dshu-release-items{margin:0;padding-left:18px}',
+  '.dshu-release-link{color:var(--dsw-alias-state-business-primary,#4d6bfe);text-decoration:none;font-size:13px}',
+  '.dshu-release-hint{display:flex;gap:8px;align-items:center;color:var(--dsw-alias-label-secondary,inherit)}',
+  '.dshu-plugin-list{display:flex;flex-direction:column;gap:8px}',
+  '.dshu-plugin{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 10px;padding:10px;border-radius:var(--dsw-radius-sm,6px);background:var(--dsw-alias-bg-layer-2,rgba(0,0,0,.03))}',
+  '.dshu-plugin-name{font-weight:600;overflow:hidden;text-overflow:ellipsis}',
+  '.dshu-plugin-version{color:var(--dsw-alias-label-secondary,inherit);font-variant-numeric:tabular-nums}',
+  '.dshu-plugin-state{grid-column:1/2;font-size:12px;color:var(--dsw-alias-label-tertiary,inherit)}',
+  '.dshu-plugin-upgrade{grid-row:1/3;grid-column:2/3;align-self:center}',
+  '.dshu-plugin-empty,.dshu-plugin-unavailable{color:var(--dsw-alias-label-secondary,inherit)}',
+  '.dshu-progress{display:flex;flex-direction:column;gap:4px;padding:10px;border-radius:var(--dsw-radius-sm,6px);background:var(--dsw-alias-bg-layer-2,rgba(0,0,0,.03));font-size:13px}',
+  '.dshu-progress[hidden]{display:none}',
+  '.dshu-progress-line::before{content:"› ";color:var(--dsw-alias-label-tertiary,inherit)}',
+  '.dshu-error{padding:10px;border-radius:var(--dsw-radius-sm,6px);background:var(--dsw-alias-state-error-bg,rgba(229,72,77,.12));color:var(--dsw-alias-state-error-primary,#e5484d)}',
+  '.dshu-notice{padding:10px;border-radius:var(--dsw-radius-sm,6px);background:var(--dsw-alias-state-business-bg,rgba(77,107,254,.1));font-size:13px}',
+  '.dshu-notice[hidden]{display:none}',
+].join('\n')
+
+type Survey = {
+  current: string
+  channels: { latest: string, next: string, alpha: string }
+  target: string
+  blocked: { code: string, message: string } | null
+  includePrerelease: boolean
+  /** 盘上已是 current、但进程还在跑旧代码：升级完成过，只差一次重启 */
+  restartRequired: boolean
+}
+
+type Release = {
+  version: string
+  channel: string
+  publishedAt: string
+  items: string[]
+  url: string
+}
+
+type ReleasesReply = {
+  releases: Release[]
+  degraded: boolean
+}
+
+type View = {
+  doc: Document
+  options: PanelOptions
+  overlay: HTMLElement
+  panel: HTMLElement
+  hostSection: HTMLElement
+  pluginsSection: HTMLElement
+  hostVersions: HTMLElement
+  hostActions: HTMLElement
+  releaseBox: HTMLElement
+  pluginHead: HTMLElement
+  pluginList: HTMLElement
+  progress: HTMLElement
+  notice: HTMLElement
+  prerelease: HTMLInputElement
+  refreshButton: HTMLButtonElement
+  upgradeButton: HTMLButtonElement | null
+  error: HTMLElement | null
+  survey: Survey | null
+  plugins: PluginUpdates | null
+  includePrerelease: boolean
+  upgradeBusy: boolean
+  token: number
+  closed: boolean
+  previousOverflow: string
+  focusBefore: Element | null
+  onKeydown: (event: KeyboardEvent) => void
+}
+
+/** 同一文档只允许一个面板；位置在 openPanel 里同步占住，避免连点叠两层。 */
+const activeViews = new WeakMap<Document, View>()
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function asString(value: unknown): string {
+  return typeof value === 'string' ? value : ''
+}
+
+function asStringOrNull(value: unknown): string | null {
+  return typeof value === 'string' && value !== '' ? value : null
+}
+
+/** base 是 origin 或部署前缀；路径常量自带 /dsh-xxx，不能再补一次。 */
+function joinUrl(base: string, path: string): string {
+  return base.replace(/\/+$/, '') + path
+}
+
+/** 浏览器的 fetch 必须绑在全局上；测试里 globalThis.fetch 是假实现。 */
+function fetchOf(doc: Document): typeof fetch {
+  const globalCandidate: unknown = (globalThis as { fetch?: unknown }).fetch
+  if (typeof globalCandidate === 'function') {
+    return (globalCandidate as typeof fetch).bind(globalThis)
+  }
+  const view = doc.defaultView
+  if (view !== null && typeof view.fetch === 'function') {
+    return view.fetch.bind(view) as typeof fetch
+  }
+  return (async () => {
+    throw new Error('当前环境没有 fetch')
+  }) as unknown as typeof fetch
+}
+
+function ensureStyle(doc: Document): void {
+  if (doc.getElementById(STYLE_ID) !== null) return
+  const style = doc.createElement('style')
+  style.id = STYLE_ID
+  style.textContent = STYLE_TEXT
+  doc.head.appendChild(style)
+}
+
+function element(doc: Document, tag: string, className: string, text?: string): HTMLElement {
+  const node = doc.createElement(tag)
+  node.className = className
+  if (text !== undefined) node.textContent = text
+  return node
+}
+
+function buttonOf(doc: Document, className: string, text: string): HTMLButtonElement {
+  const node = doc.createElement('button')
+  node.type = 'button'
+  node.className = className
+  node.textContent = text
+  return node
+}
+
+function live(view: View, token: number): boolean {
+  return !view.closed && view.token === token
+}
+
+function hasNewerTarget(survey: Survey | null): boolean {
+  return survey !== null && survey.target !== '' && survey.target !== survey.current
+}
+
+/** 有更新，或升级装完还没重启——两种状态都要让入口角标亮着。 */
+function hasHostUpdate(survey: Survey | null): boolean {
+  return hasNewerTarget(survey) || (survey !== null && survey.restartRequired)
+}
+
+function normalizeSurvey(value: unknown): Survey | null {
+  if (!isRecord(value)) return null
+  const current = asString(value.current)
+  if (current === '') return null
+  const channelsRaw = isRecord(value.channels) ? value.channels : {}
+  const blockedRaw = isRecord(value.blocked) ? value.blocked : null
+  return {
+    current,
+    channels: {
+      latest: asString(channelsRaw.latest),
+      next: asString(channelsRaw.next),
+      alpha: asString(channelsRaw.alpha),
+    },
+    target: asStringOrNull(value.target) ?? '',
+    blocked:
+      blockedRaw === null
+        ? null
+        : { code: asString(blockedRaw.code), message: asString(blockedRaw.message) },
+    includePrerelease: value.includePrerelease === true,
+    restartRequired: value.restartRequired === true,
+  }
+}
+
+function normalizeReleases(value: unknown): ReleasesReply {
+  if (!isRecord(value)) return { releases: [], degraded: true }
+  const degraded = value.degraded === true
+  const list: Release[] = []
+  if (Array.isArray(value.releases)) {
+    for (const entry of value.releases) {
+      if (!isRecord(entry)) continue
+      const version = asString(entry.version)
+      if (version === '') continue
+      const items: string[] = []
+      if (Array.isArray(entry.items)) {
+        for (const item of entry.items) {
+          if (typeof item === 'string' && item !== '') items.push(item)
+        }
+      }
+      list.push({
+        version,
+        channel: asString(entry.channel),
+        publishedAt: asString(entry.publishedAt),
+        items,
+        url: asString(entry.url),
+      })
+    }
+  }
+  return { releases: list, degraded }
+}
+
+function channelOf(survey: Survey, version: string): string {
+  if (survey.channels.alpha !== '' && survey.channels.alpha === version) return 'alpha'
+  if (survey.channels.next !== '' && survey.channels.next === version) return 'next'
+  if (survey.channels.latest !== '' && survey.channels.latest === version) return 'latest'
+  return ''
+}
+
+function releaseTitle(release: Release): string {
+  const parts = ['v' + release.version]
+  if (release.channel !== '') parts.push(release.channel)
+  if (release.publishedAt !== '') parts.push(release.publishedAt.slice(0, 10))
+  return parts.join(' · ')
+}
+
+function phaseLabel(phase: string): string {
+  const label = PHASE_LABELS[phase]
+  return label === undefined ? (phase === '' ? '进行中' : phase) : label
+}
+
+function errorTextOf(value: unknown): string {
+  if (typeof value === 'string' && value !== '') return value
+  if (isRecord(value)) {
+    const message = asString(value.message)
+    if (message !== '') return message
+    const code = asString(value.code)
+    if (code !== '') return code
+  }
+  return '升级失败'
+}
+
+function failureTextOf(event: Record<string, unknown>): string {
+  if (event.error !== undefined && event.error !== null) return errorTextOf(event.error)
+  const message = asString(event.message)
+  return message !== '' ? message : '升级失败'
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms)
+  })
+}
+
+async function readJsonBody(response: Response): Promise<unknown> {
+  try {
+    return await response.json()
+  } catch {
+    return null
+  }
+}
+
+type JsonReply = { ok: boolean, status: number, body: unknown }
+
+async function requestJson(f: typeof fetch, url: string, init?: RequestInit): Promise<JsonReply> {
+  const response = await f(url, init)
+  let body: unknown = null
+  try {
+    body = await response.json()
+  } catch {
+    body = null
+  }
+  return { ok: response.ok, status: response.status, body }
+}
+
+type StreamReader = {
+  read(): Promise<{ done: boolean, value?: Uint8Array }>
+}
+
+type StreamBody = {
+  getReader(): StreamReader
+}
+
+function drainLines(buffer: string, onLine: (line: string) => void): string {
+  let rest = buffer
+  for (;;) {
+    const index = rest.indexOf('\n')
+    if (index < 0) return rest
+    const line = rest.slice(0, index).trim()
+    rest = rest.slice(index + 1)
+    if (line !== '') onLine(line)
+  }
+}
+
+function emitLine(line: string, sink: (event: Record<string, unknown>) => void): void {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(line)
+  } catch {
+    return
+  }
+  if (isRecord(parsed)) sink(parsed)
+}
+
+/**
+ * 逐行读 NDJSON。真浏览器里 response.body 一定有 getReader；jsdom 的假响应
+ * 没有 body，退回 text() 再按换行拆——否则进度一条都读不到。
+ */
+async function readNdjson(response: Response, sink: (event: Record<string, unknown>) => void): Promise<void> {
+  const stream: unknown = response.body
+  const readerHost =
+    stream !== null && typeof stream === 'object' && 'getReader' in stream
+      ? (stream as StreamBody)
+      : null
+  if (readerHost !== null && typeof readerHost.getReader === 'function') {
+    const reader = readerHost.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    for (;;) {
+      const chunk = await reader.read()
+      if (chunk.value !== undefined) buffer += decoder.decode(chunk.value, { stream: true })
+      buffer = drainLines(buffer, (line) => {
+        emitLine(line, sink)
+      })
+      if (chunk.done === true) break
+    }
+    buffer += decoder.decode()
+    const tail = buffer.trim()
+    if (tail !== '') emitLine(tail, sink)
+    return
+  }
+
+  const text = await response.text()
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim()
+    if (trimmed !== '') emitLine(trimmed, sink)
+  }
+}
+
+function buildView(doc: Document, options: PanelOptions): View {
+  ensureStyle(doc)
+
+  const overlay = element(doc, 'div', 'dshu-overlay')
+  overlay.setAttribute(PANEL_MARK, '')
+  const panel = element(doc, 'div', 'dshu-panel')
+  panel.setAttribute('role', 'dialog')
+  panel.setAttribute('aria-modal', 'true')
+  panel.setAttribute('aria-label', 'DSH 升级')
+
+  const head = element(doc, 'div', 'dshu-head')
+  const title = element(doc, 'span', 'dshu-title', 'DSH 升级')
+  const closeButton = buttonOf(doc, 'dshu-close', '×')
+  closeButton.setAttribute('aria-label', '关闭')
+  head.append(title, closeButton)
+
+  const hostSection = element(doc, 'section', 'dshu-section')
+  hostSection.setAttribute('data-k', 'host')
+  const hostTitle = doc.createElement('h3')
+  hostTitle.textContent = '本体'
+  const hostVersions = element(doc, 'div', 'dshu-versions')
+  const hostActions = element(doc, 'div', 'dshu-host-actions')
+  const releaseBox = element(doc, 'div', 'dshu-release')
+  releaseBox.hidden = true
+  const hostRow = element(doc, 'div', 'dshu-row')
+  const toggleLabel = element(doc, 'label', 'dshu-toggle')
+  const prerelease = doc.createElement('input')
+  prerelease.type = 'checkbox'
+  prerelease.className = 'dshu-prerelease'
+  toggleLabel.append(prerelease, doc.createTextNode('显示预发布版本'))
+  const refreshButton = buttonOf(doc, 'dshu-refresh', '重新检查')
+  hostRow.append(toggleLabel, refreshButton)
+  hostSection.append(hostTitle, hostVersions, hostActions, releaseBox, hostRow)
+
+  const pluginsSection = element(doc, 'section', 'dshu-section')
+  pluginsSection.setAttribute('data-k', 'plugins')
+  const pluginHead = doc.createElement('h3')
+  pluginHead.textContent = '插件'
+  const pluginList = element(doc, 'div', 'dshu-plugin-list')
+  pluginsSection.append(pluginHead, pluginList)
+
+  const progress = element(doc, 'div', 'dshu-progress')
+  progress.hidden = true
+  const notice = element(doc, 'div', 'dshu-notice')
+  notice.hidden = true
+
+  panel.append(head, hostSection, pluginsSection, progress, notice)
+  overlay.appendChild(panel)
+
+  const view: View = {
+    doc,
+    options,
+    overlay,
+    panel,
+    hostSection,
+    pluginsSection,
+    hostVersions,
+    hostActions,
+    releaseBox,
+    pluginHead,
+    pluginList,
+    progress,
+    notice,
+    prerelease,
+    refreshButton,
+    upgradeButton: null,
+    error: null,
+    survey: null,
+    plugins: null,
+    includePrerelease: false,
+    upgradeBusy: false,
+    token: 1,
+    closed: false,
+    previousOverflow: '',
+    focusBefore: doc.activeElement,
+    onKeydown: () => {},
+  }
+
+  view.onKeydown = (event: KeyboardEvent): void => {
+    if (event.key === 'Escape') close(view)
+  }
+  closeButton.addEventListener('click', () => {
+    close(view)
+  })
+  overlay.addEventListener('click', (event) => {
+    if (event.target === overlay) close(view)
+  })
+  prerelease.addEventListener('change', () => {
+    // 升级进行中重查会用旧 survey 重画，按钮忽隐忽现且点击无效果；直接按住。
+    if (view.upgradeBusy) return
+    const token = view.token
+    view.includePrerelease = prerelease.checked
+    void loadHost(view, token, { check: true, force: false })
+  })
+  refreshButton.addEventListener('click', () => {
+    if (view.upgradeBusy) return
+    const token = view.token
+    view.includePrerelease = prerelease.checked
+    void loadHost(view, token, { check: true, force: true })
+  })
+
+  return view
+}
+
+function close(view: View): void {
+  if (view.closed) return
+  view.closed = true
+  view.token += 1
+  view.doc.removeEventListener('keydown', view.onKeydown)
+  view.overlay.remove()
+  view.doc.body.style.overflow = view.previousOverflow
+  if (activeViews.get(view.doc) === view) activeViews.delete(view.doc)
+  if (lastView === view) lastView = null
+  const focusBefore = view.focusBefore
+  if (
+    focusBefore !== null &&
+    typeof (focusBefore as HTMLElement).focus === 'function' &&
+    focusBefore.isConnected
+  ) {
+    try {
+      ;(focusBefore as HTMLElement).focus()
+    } catch {
+      // 焦点还回去失败不算错误：面板已经关掉了。
+    }
+  }
+  try {
+    view.options.onClose?.()
+  } catch {
+    // 收尾回调自己的异常不该冒到调用方。
+  }
+}
+
+/** WeakMap 不迭代，另记一份最近打开的视图供无参 closePanel() 收尾。 */
+let lastView: View | null = null
+
+/** 关闭当前面板；doc 给定时只关这个文档里的。 */
+export function closePanel(doc?: Document): void {
+  const view = doc === undefined ? lastView : (activeViews.get(doc) ?? null)
+  if (view !== null) close(view)
+}
+
+function emitState(view: View): void {
+  const hostUpdate = hasHostUpdate(view.survey)
+  const pluginUpdate =
+    view.plugins !== null && view.plugins.available && view.plugins.updatable.length > 0
+  try {
+    view.options.onState?.({ hasUpdate: hostUpdate || pluginUpdate, busy: view.upgradeBusy })
+  } catch {
+    // 角标刷新失败不影响面板本身。
+  }
+}
+
+function showError(view: View, text: string): void {
+  if (view.error === null) {
+    const bar = element(view.doc, 'div', 'dshu-error')
+    bar.setAttribute('role', 'alert')
+    view.panel.insertBefore(bar, view.progress)
+    view.error = bar
+  }
+  view.error.textContent = text
+}
+
+function clearError(view: View): void {
+  if (view.error === null) return
+  view.error.remove()
+  view.error = null
+}
+
+function setNotice(view: View, text: string): void {
+  if (text === '') {
+    view.notice.hidden = true
+    view.notice.textContent = ''
+    return
+  }
+  view.notice.hidden = false
+  view.notice.textContent = text
+}
+
+function resetProgress(view: View): void {
+  view.progress.textContent = ''
+  view.progress.hidden = false
+}
+
+function addProgress(view: View, text: string): void {
+  view.progress.hidden = false
+  const line = element(view.doc, 'div', 'dshu-progress-line', text)
+  view.progress.appendChild(line)
+}
+
+function renderSurvey(view: View): void {
+  const doc = view.doc
+  view.hostVersions.textContent = ''
+  view.releaseBox.textContent = ''
+  view.releaseBox.hidden = true
+  if (view.upgradeButton !== null) {
+    view.upgradeButton.remove()
+    view.upgradeButton = null
+  }
+
+  const survey = view.survey
+  if (survey === null) {
+    view.hostVersions.appendChild(element(doc, 'span', 'dshu-version', '读不到版本状态'))
+    return
+  }
+
+  if (survey.restartRequired) {
+    // target === current 时不能报「已是最新」：盘上是新的，跑着的进程还是旧的。
+    view.hostVersions.appendChild(
+      element(
+        doc,
+        'span',
+        'dshu-current dshu-restart-required',
+        '已升级到 ' + survey.current + '，需重启 dsh web 才生效',
+      ),
+    )
+  }
+
+  if (!hasNewerTarget(survey)) {
+    if (!survey.restartRequired) {
+      view.hostVersions.appendChild(
+        element(doc, 'span', 'dshu-current', '已是最新（当前 ' + survey.current + '）'),
+      )
+    }
+    return
+  }
+
+  const target = survey.target
+  view.hostVersions.append(
+    element(doc, 'span', 'dshu-version dshu-current', '当前 ' + survey.current),
+    element(doc, 'span', 'dshu-arrow', '→'),
+    element(doc, 'span', 'dshu-version dshu-target', '目标 ' + target),
+  )
+  const channel = channelOf(survey, target)
+  if (channel !== '') {
+    view.hostVersions.appendChild(element(doc, 'span', 'dshu-channel', channel + ' 通道'))
+  }
+
+  const upgrade = buttonOf(doc, 'dshu-upgrade-btn', '升级到 ' + target)
+  if (survey.blocked !== null) {
+    upgrade.disabled = true
+    upgrade.setAttribute('data-blocked', '')
+    upgrade.textContent = survey.blocked.message !== '' ? survey.blocked.message : '需要 Node（本机版本不满足）'
+    upgrade.title = survey.blocked.code
+  } else {
+    upgrade.addEventListener('click', () => {
+      void runHostUpgrade(view, view.token)
+    })
+  }
+  view.hostActions.appendChild(upgrade)
+  view.upgradeButton = upgrade
+}
+
+function releaseTagUrl(target: string): string {
+  return RELEASE_PAGE + encodeURIComponent(target)
+}
+
+/** 发布页链接只认 http(s)：javascript: 之类的 href 不能进 DOM。 */
+function isHttpUrl(url: string): boolean {
+  return /^https?:\/\//i.test(url)
+}
+
+function renderReleases(view: View, reply: ReleasesReply): void {
+  const doc = view.doc
+  const box = view.releaseBox
+  box.textContent = ''
+  const survey = view.survey
+  if (survey === null || !hasNewerTarget(survey)) {
+    box.hidden = true
+    return
+  }
+
+  if (reply.degraded) {
+    box.hidden = false
+    const hint = element(doc, 'div', 'dshu-release-hint', '更新内容拉取失败')
+    const link = doc.createElement('a')
+    link.className = 'dshu-release-link'
+    link.href = releaseTagUrl(survey.target)
+    link.target = '_blank'
+    link.rel = 'noreferrer'
+    link.textContent = '去 GitHub 看'
+    hint.appendChild(link)
+    box.appendChild(hint)
+    return
+  }
+
+  if (reply.releases.length === 0) {
+    box.hidden = true
+    return
+  }
+
+  box.hidden = false
+  for (const [index, release] of reply.releases.entries()) {
+    const row = element(doc, 'div', 'dshu-release-row')
+    const toggle = buttonOf(doc, 'dshu-release-toggle', releaseTitle(release))
+    toggle.setAttribute('aria-expanded', index === 0 ? 'true' : 'false')
+    const body = element(doc, 'div', 'dshu-release-body')
+    body.hidden = index !== 0
+    const list = doc.createElement('ul')
+    list.className = 'dshu-release-items'
+    if (release.items.length === 0) {
+      const item = doc.createElement('li')
+      item.textContent = '该版本没有列出更新条目'
+      list.appendChild(item)
+    }
+    for (const text of release.items) {
+      const item = doc.createElement('li')
+      item.textContent = text
+      list.appendChild(item)
+    }
+    body.appendChild(list)
+    if (release.url !== '' && isHttpUrl(release.url)) {
+      const link = doc.createElement('a')
+      link.className = 'dshu-release-link'
+      link.href = release.url
+      link.target = '_blank'
+      link.rel = 'noreferrer'
+      link.textContent = '看这次发布'
+      body.appendChild(link)
+    }
+    toggle.addEventListener('click', () => {
+      body.hidden = !body.hidden
+      toggle.setAttribute('aria-expanded', body.hidden ? 'false' : 'true')
+    })
+    row.append(toggle, body)
+    box.appendChild(row)
+  }
+}
+
+function renderPlugins(view: View): void {
+  const doc = view.doc
+  view.pluginList.textContent = ''
+  const plugins = view.plugins
+  if (plugins === null) {
+    view.pluginHead.textContent = '插件'
+    return
+  }
+  if (!plugins.available) {
+    view.pluginHead.textContent = '插件'
+    view.pluginList.appendChild(element(doc, 'div', 'dshu-plugin-unavailable', '插件更新不可用'))
+    return
+  }
+  view.pluginHead.textContent =
+    plugins.updatable.length > 0 ? '插件（' + plugins.updatable.length + ' 个可更新）' : '插件'
+  if (plugins.updatable.length === 0) {
+    view.pluginList.appendChild(element(doc, 'div', 'dshu-plugin-empty', '已是最新'))
+    return
+  }
+  for (const update of plugins.updatable) {
+    view.pluginList.appendChild(createPluginRow(view, update))
+  }
+}
+
+function createPluginRow(view: View, update: PluginUpdate): HTMLElement {
+  const doc = view.doc
+  const row = element(doc, 'div', 'dshu-plugin')
+  row.setAttribute('data-name', update.name)
+  const name = element(doc, 'div', 'dshu-plugin-name', update.name)
+  const version = element(doc, 'div', 'dshu-plugin-version', update.from + ' → ' + update.to)
+  const state = element(doc, 'div', 'dshu-plugin-state')
+  const upgrade = buttonOf(doc, 'dshu-plugin-upgrade', '升级')
+  upgrade.addEventListener('click', () => {
+    void runPluginUpdate(view, update, upgrade, state)
+  })
+  row.append(name, version, state, upgrade)
+  return row
+}
+
+async function loadHost(
+  view: View,
+  token: number,
+  mode: 'status' | { check: boolean, force: boolean },
+): Promise<void> {
+  const f = fetchOf(view.doc)
+  const base = view.options.apiBase ?? ''
+  try {
+    let reply: JsonReply
+    if (mode === 'status') {
+      reply = await requestJson(f, joinUrl(base, STATUS_PATH), {
+        method: 'GET',
+        credentials: 'same-origin',
+        headers: { ...HOST_HEADERS },
+      })
+    } else {
+      reply = await requestJson(f, joinUrl(base, CHECK_PATH), {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { ...HOST_HEADERS, 'content-type': 'application/json' },
+        body: JSON.stringify({ includePrerelease: view.includePrerelease, force: mode.force }),
+      })
+    }
+    if (!live(view, token)) return
+    if (!reply.ok) {
+      // 刷新偶尔失败不该把上一份好数据抹掉：角标和升级按钮会跟着凭空消失。
+      if (view.survey === null) {
+        renderSurvey(view)
+        emitState(view)
+      }
+      showError(view, '读取版本状态失败（HTTP ' + reply.status + '）')
+      return
+    }
+    const survey = normalizeSurvey(reply.body)
+    view.survey = survey
+    clearError(view)
+    renderSurvey(view)
+    emitState(view)
+    if (!live(view, token)) return
+    if (!hasNewerTarget(survey)) return
+    const releases = await requestJson(
+      f,
+      joinUrl(base, RELEASES_PATH) +
+        '?from=' +
+        encodeURIComponent(survey === null ? '' : survey.current) +
+        '&to=' +
+        encodeURIComponent(survey === null ? '' : survey.target),
+      { method: 'GET', credentials: 'same-origin', headers: { ...HOST_HEADERS } },
+    )
+    if (!live(view, token)) return
+    renderReleases(view, releases.ok ? normalizeReleases(releases.body) : { releases: [], degraded: true })
+  } catch {
+    if (!live(view, token)) return
+    showError(view, '读取版本状态失败，请刷新后重试')
+  }
+}
+
+async function loadPlugins(view: View, token: number): Promise<void> {
+  const base = view.options.apiBase ?? ''
+  try {
+    const plugins = await fetchPluginUpdates(fetchOf(view.doc), base)
+    if (!live(view, token)) return
+    view.plugins = plugins
+    renderPlugins(view)
+    emitState(view)
+  } catch {
+    if (!live(view, token)) return
+    view.plugins = { available: false, updatable: [] }
+    renderPlugins(view)
+    emitState(view)
+  }
+}
+
+async function runHostUpgrade(view: View, token: number): Promise<void> {
+  const survey = view.survey
+  if (survey === null || !hasNewerTarget(survey) || view.upgradeBusy) return
+  const target = survey.target
+  const f = fetchOf(view.doc)
+  const base = view.options.apiBase ?? ''
+
+  view.upgradeBusy = true
+  if (view.upgradeButton !== null) view.upgradeButton.disabled = true
+  view.prerelease.disabled = true
+  view.refreshButton.disabled = true
+  clearError(view)
+  setNotice(view, '')
+  resetProgress(view)
+  emitState(view)
+
+  try {
+    const response = await f(joinUrl(base, UPGRADE_PATH), {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { ...HOST_HEADERS, 'content-type': 'application/json' },
+      body: JSON.stringify({ target }),
+    })
+    if (!live(view, token)) return
+
+    if (!response.ok) {
+      const body = await readJsonBody(response)
+      if (!live(view, token)) return
+      const code = isRecord(body) ? asString(body.code) : ''
+      const message = isRecord(body) ? asString(body.message) : ''
+      if (response.status === 409 || code === 'BUSY') {
+        setNotice(view, message !== '' ? message : '已有一轮升级在进行')
+      } else {
+        showError(view, message !== '' ? message : '升级请求失败（HTTP ' + response.status + '）')
+      }
+      finishHostBusy(view)
+      return
+    }
+
+    await consumeUpgrade(view, token, response, target)
+    finishHostBusy(view)
+  } catch {
+    if (!live(view, token)) return
+    showError(view, '升级请求失败，请检查网络后重试')
+    finishHostBusy(view)
+  }
+}
+
+function finishHostBusy(view: View): void {
+  view.upgradeBusy = false
+  view.prerelease.disabled = false
+  view.refreshButton.disabled = false
+  if (view.upgradeButton !== null) {
+    const blocked = view.survey !== null && view.survey.blocked !== null
+    view.upgradeButton.disabled = blocked || !hasNewerTarget(view.survey)
+  }
+  emitState(view)
+}
+
+async function consumeUpgrade(view: View, token: number, response: Response, target: string): Promise<void> {
+  let sawDone = false
+  let failure: string | null = null
+  try {
+    await readNdjson(response, (event) => {
+      if (!live(view, token)) return
+      const phase = asString(event.phase)
+      const message = asString(event.message)
+      if (phase === 'fail' || (event.error !== undefined && event.error !== null)) {
+        failure = failureTextOf(event)
+        return
+      }
+      if (event.done === true) sawDone = true
+      if (phase === 'done') {
+        addProgress(view, phaseLabel('done'))
+        return
+      }
+      addProgress(view, message !== '' ? phaseLabel(phase) + '：' + message : phaseLabel(phase))
+    })
+  } catch {
+    if (!live(view, token)) return
+    showError(view, '升级进度读到一半断了，请刷新后确认结果')
+    return
+  }
+  if (!live(view, token)) return
+
+  if (failure !== null) {
+    showError(view, failure)
+    return
+  }
+  if (!sawDone) {
+    showError(view, '升级没有正常结束，请刷新后确认结果')
+    return
+  }
+
+  addProgress(view, '已升级到 ' + target)
+  await continueToRestart(view, token, target)
+}
+
+async function continueToRestart(view: View, token: number, target: string): Promise<void> {
+  const f = fetchOf(view.doc)
+  const base = view.options.apiBase ?? ''
+  const manualRestart = (reason: string): void => {
+    setNotice(view, '已升级到 ' + target + '，' + reason + '，需手动重启')
+  }
+
+  let status: Response
+  try {
+    status = await f(joinUrl(base, RESTART_STATUS_PATH), {
+      method: 'GET',
+      credentials: 'same-origin',
+      headers: { ...RESTART_HEADERS },
+    })
+  } catch {
+    if (live(view, token)) manualRestart('没找到 dsh-restart')
+    return
+  }
+  if (!live(view, token)) return
+  if (!status.ok) {
+    // 只有 404 才意味着插件不在；403/500 是「在，但拒绝/坏了」，不能误导人去装。
+    manualRestart(
+      status.status === 404
+        ? '没找到 dsh-restart'
+        : status.status === 401 || status.status === 403
+          ? 'dsh-restart 拒绝访问（HTTP ' + status.status + '）'
+          : 'dsh-restart 状态查询失败（HTTP ' + status.status + '）',
+    )
+    return
+  }
+
+  let precheck: Response
+  try {
+    precheck = await f(joinUrl(base, RESTART_PRECHECK_PATH), {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { ...RESTART_HEADERS },
+    })
+  } catch {
+    if (live(view, token)) manualRestart('预检请求发不出去')
+    return
+  }
+  if (!live(view, token)) return
+  if (!precheck.ok) {
+    manualRestart('预检失败（HTTP ' + precheck.status + '）')
+    return
+  }
+
+  let passed = true
+  try {
+    await readNdjson(precheck, (event) => {
+      if (!live(view, token)) return
+      if (event.ok === false) passed = false
+      if (event.error !== undefined && event.error !== null) passed = false
+      const stage = asString(event.stage)
+      if (stage !== '') {
+        // 预检会克隆 profile 再起一个冒烟实例，几十秒没反馈像是卡死；把阶段推进度条。
+        addProgress(
+          view,
+          '重启预检：' +
+            (RESTART_STAGE_LABELS[stage] ?? stage) +
+            (event.ok === false ? '（未通过）' : '（通过）'),
+        )
+        return
+      }
+      // 失败事件也带 done；别让进度条写「完成」而下面的通知说没通过。
+      if (event.done === true && event.ok !== false && passed) addProgress(view, '重启预检完成')
+    })
+  } catch {
+    if (live(view, token)) manualRestart('预检读到一半断了')
+    return
+  }
+  if (!live(view, token)) return
+  if (!passed) {
+    manualRestart('预检没通过')
+    return
+  }
+
+  let restart: Response
+  try {
+    restart = await f(joinUrl(base, RESTART_PATH), {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { ...RESTART_HEADERS },
+    })
+  } catch {
+    if (live(view, token)) manualRestart('重启请求发不出去')
+    return
+  }
+  if (!live(view, token)) return
+  if (restart.status === 409) {
+    setNotice(view, '已经有一轮重启在进行，请稍后手动刷新页面确认')
+    return
+  }
+  if (!restart.ok) {
+    manualRestart('重启请求失败（HTTP ' + restart.status + '）')
+    return
+  }
+  setNotice(view, '已升级到 ' + target + '，正在重启…')
+}
+
+async function runPluginUpdate(
+  view: View,
+  update: PluginUpdate,
+  button: HTMLButtonElement,
+  state: HTMLElement,
+): Promise<void> {
+  const token = view.token
+  button.disabled = true
+  state.textContent = '正在升级…'
+  try {
+    const f = fetchOf(view.doc)
+    const base = view.options.apiBase ?? ''
+    const started = await startPluginUpdate(update.name, f, base)
+    if (!live(view, token)) return
+    if (started.operationId === '') {
+      handlePluginStartFailure(view, started.code, started.message, state)
+      button.disabled = false
+      return
+    }
+
+    const interval = view.options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS
+    for (let round = 0; round < MAX_POLLS; round += 1) {
+      const operation = await pollPluginOperation(started.operationId, f, base)
+      if (!live(view, token)) return
+      if (operation.status === 'queued' || operation.status === 'running') {
+        await sleep(interval)
+        if (!live(view, token)) return
+        continue
+      }
+      handlePluginOperation(view, operation, state)
+      button.disabled = false
+      return
+    }
+    state.textContent = '升级超时，稍后重试'
+    showError(view, update.name + ' 升级超时，请刷新后确认结果')
+    button.disabled = false
+  } catch {
+    if (!live(view, token)) return
+    state.textContent = '升级失败'
+    showError(view, '插件升级请求失败，请稍后重试')
+    button.disabled = false
+  }
+}
+
+/** 请求层不可用（市场没开、登录失效、记录丢失）不算安装失败，不写红条。 */
+function handlePluginStartFailure(
+  view: View,
+  code: string | undefined,
+  message: string | undefined,
+  state: HTMLElement,
+): void {
+  if (isPluginUnavailableCode(code)) {
+    state.textContent = '插件更新不可用'
+    return
+  }
+  state.textContent = '升级失败'
+  showError(view, message !== undefined && message !== '' ? message : '插件升级失败')
+}
+
+function handlePluginOperation(view: View, operation: PluginOperation, state: HTMLElement): void {
+  switch (operation.status) {
+    case 'succeeded':
+      state.textContent = '已升级'
+      if (operation.restartRequired) setNotice(view, '插件已升级，重启 DSH 后生效')
+      return
+    case 'failed':
+      if (isPluginUnavailableCode(operation.code)) {
+        state.textContent = '插件更新不可用'
+        return
+      }
+      state.textContent = '升级失败'
+      showError(view, operation.message !== undefined && operation.message !== '' ? operation.message : '插件升级失败')
+      return
+    case 'cancelled':
+      state.textContent = '已取消'
+      return
+    case 'rolled-back':
+      state.textContent = '已回滚'
+      showError(view, operation.message !== undefined && operation.message !== '' ? operation.message : '插件升级失败，已回滚')
+      return
+    default:
+      return
+  }
+}
+
+/**
+ * 打开面板。同一文档重复调用直接返回，不会叠第二层遮罩。
+ * 返回时首屏（本体状态、更新内容、插件列表）已经画完；之后的动作都是异步的。
+ */
+export async function openPanel(doc: Document, opts: PanelOptions = {}): Promise<void> {
+  if (activeViews.get(doc) !== undefined) return
+  if (doc.querySelector('[' + PANEL_MARK + ']') !== null) return
+
+  const view = buildView(doc, opts)
+  const body = doc.body
+  view.previousOverflow = body.style.overflow
+  body.style.overflow = 'hidden'
+  body.appendChild(view.overlay)
+  activeViews.set(doc, view)
+  lastView = view
+  doc.addEventListener('keydown', view.onKeydown)
+
+  const token = view.token
+  emitState(view)
+  try {
+    await Promise.all([loadHost(view, token, 'status'), loadPlugins(view, token)])
+  } catch {
+    if (live(view, token)) showError(view, '加载升级信息失败，请刷新后重试')
+  }
+}
+
+/** 底栏入口只需要一个布尔：本体或插件任一有更新。读不到就当没有。 */
+export async function probeHasUpdate(doc: Document, opts: PanelOptions = {}): Promise<boolean> {
+  const f = fetchOf(doc)
+  const base = opts.apiBase ?? ''
+  try {
+    const [reply, plugins] = await Promise.all([
+      requestJson(f, joinUrl(base, STATUS_PATH), {
+        method: 'GET',
+        credentials: 'same-origin',
+        headers: { ...HOST_HEADERS },
+      }).catch(() => null),
+      fetchPluginUpdates(f, base).catch(() => null),
+    ])
+    const survey = reply !== null && reply.ok ? normalizeSurvey(reply.body) : null
+    const hostUpdate = hasHostUpdate(survey)
+    const pluginUpdate =
+      plugins !== null && plugins.available && plugins.updatable.length > 0
+    return hostUpdate || pluginUpdate
+  } catch {
+    return false
+  }
+}

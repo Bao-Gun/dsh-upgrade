@@ -1,0 +1,186 @@
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
+import type { Channel } from './versions'
+
+/** 缓存里的一条版本记录；Task 5 的 ReleaseEntry 就是它的别名 */
+export type CachedRelease = {
+  version: string
+  channel: Channel
+  publishedAt: string
+  items: string[]
+  url: string
+}
+
+export type Cache = {
+  registry?: {
+    checkedAt: number
+    channels: Record<string, string | undefined>
+    versions: string[]
+    publishedAt: Record<string, string>
+  }
+  releases?: {
+    checkedAt: number
+    byVersion: Record<string, CachedRelease[]>
+  }
+}
+
+export type Pending = { from: string; to: string; startedAt: number }
+
+export type Last = {
+  running: boolean
+  lastResult?: { to: string; at: number; restartRequired: boolean }
+  lastError?: { code: string; message: string; at: number }
+}
+
+const DEFAULT_TTL_MS = 6 * 60 * 60 * 1000
+const CACHE_FILE = 'cache.json'
+const PENDING_FILE = 'pending.json'
+const LAST_FILE = 'last.json'
+
+let tmpSeq = 0
+
+export function rootDir(): string {
+  const fromEnv = process.env.DSH_UPGRADE_ROOT
+  if (fromEnv !== undefined && fromEnv !== '') return fromEnv
+  return join(homedir(), '.dsh', 'dsh-upgrade')
+}
+
+export async function ensureDir(path: string): Promise<void> {
+  await mkdir(path, { recursive: true })
+}
+
+export function backupDir(root: string, version: string): string {
+  return join(root, 'backup', version)
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** 读失败一律 null：文件不存在、读不了、坏 JSON、JSON 不是对象都算 */
+async function readJsonRecord(file: string): Promise<Record<string, unknown> | null> {
+  try {
+    const text = await readFile(file, 'utf8')
+    const parsed: unknown = JSON.parse(text)
+    return isRecord(parsed) ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+/** 先写临时文件再 rename，避免进程中途死掉留下半截 JSON */
+async function writeJsonAtomic(file: string, value: unknown): Promise<void> {
+  await ensureDir(dirname(file))
+  const tmp = `${file}.${process.pid}.${(tmpSeq += 1)}.tmp`
+  try {
+    await writeFile(tmp, JSON.stringify(value, null, 2) + '\n', 'utf8')
+    await rename(tmp, file)
+  } catch (error) {
+    await unlink(tmp).catch(() => {})
+    throw error
+  }
+}
+
+function isFreshSection(section: unknown, now: number, ttlMs: number): boolean {
+  if (!isRecord(section)) return false
+  const checkedAt = section.checkedAt
+  if (typeof checkedAt !== 'number' || !Number.isFinite(checkedAt)) return false
+  return now - checkedAt <= ttlMs
+}
+
+/**
+ * registry 与 releases 各有自己的 checkedAt，因此各自判 TTL；
+ * 两块都过期（或文件缺失/损坏）时返回 null。
+ */
+export async function readCache(
+  now: number,
+  ttlMs: number = DEFAULT_TTL_MS,
+): Promise<Cache | null> {
+  const raw = await readJsonRecord(join(rootDir(), CACHE_FILE))
+  if (raw === null) return null
+  const cache: Cache = {}
+  if (isFreshSection(raw.registry, now, ttlMs)) {
+    cache.registry = raw.registry as Cache['registry']
+  }
+  if (isFreshSection(raw.releases, now, ttlMs)) {
+    cache.releases = raw.releases as Cache['releases']
+  }
+  if (cache.registry === undefined && cache.releases === undefined) return null
+  return cache
+}
+
+/**
+ * 字面浅合并：传进来的顶层分区整体替换。显式传 undefined 的键会先写成
+ * undefined，JSON.stringify 随即把它丢掉——所以 writeCache({ registry: undefined })
+ * 就是「删掉 registry 分区、下次强制重新拉」。
+ */
+export async function writeCache(delta: Partial<Cache>): Promise<void> {
+  const file = join(rootDir(), CACHE_FILE)
+  const previous = (await readJsonRecord(file)) ?? {}
+  const next: Record<string, unknown> = { ...previous, ...delta }
+  await writeJsonAtomic(file, next)
+}
+
+export async function readPending(): Promise<Pending | null> {
+  const raw = await readJsonRecord(join(rootDir(), PENDING_FILE))
+  if (raw === null) return null
+  const { from, to, startedAt } = raw
+  if (typeof from !== 'string' || from === '' || typeof to !== 'string' || to === '') {
+    return null
+  }
+  if (typeof startedAt !== 'number' || !Number.isFinite(startedAt)) return null
+  return { from, to, startedAt }
+}
+
+export async function writePending(pending: Pending): Promise<void> {
+  await writeJsonAtomic(join(rootDir(), PENDING_FILE), pending)
+}
+
+export async function clearPending(): Promise<void> {
+  await unlink(join(rootDir(), PENDING_FILE)).catch(() => {})
+}
+
+/** running 缺省按 false 读，其余字段原样带回 */
+export async function readLast(): Promise<Last | null> {
+  const raw = await readJsonRecord(join(rootDir(), LAST_FILE))
+  if (raw === null) return null
+  return { ...raw, running: raw.running === true } as Last
+}
+
+/**
+ * 字面浅合并：没传的字段保持不变；显式传 undefined 的字段会被删掉
+ * （JSON.stringify 丢 undefined）。Task 7 成功路径必须显式传
+ * lastError: undefined，否则上一次失败留下的错误会一直挂在盘上。
+ */
+export async function writeLast(patch: Partial<Last>): Promise<void> {
+  const file = join(rootDir(), LAST_FILE)
+  const previous = (await readJsonRecord(file)) ?? {}
+  const next: Record<string, unknown> = { ...previous, ...patch }
+  await writeJsonAtomic(file, next)
+}
+
+/**
+ * 磁盘上已经是 current，却还挂着「需重启」：说明上次升级装完但进程没换过来。
+ * 只认 to === current 的标记，避免把旧版本升级留下的标记错算到新版本头上。
+ */
+export async function readRestartRequired(current: string): Promise<boolean> {
+  const last = await readLast()
+  const result = last?.lastResult
+  return result !== undefined && result.restartRequired === true && result.to === current
+}
+
+/**
+ * 进程启动即证明盘上的版本已经在跑，那个「需重启」标记已经被兑现。
+ * 读写失败都只当没清掉，绝不抛——插件启动不能被一个状态文件拖垮。
+ */
+export async function clearRestartRequired(current: string): Promise<void> {
+  try {
+    const last = await readLast()
+    const result = last?.lastResult
+    if (result === undefined || result.restartRequired !== true || result.to !== current) return
+    await writeLast({ lastResult: { ...result, restartRequired: false } })
+  } catch {
+    // 最坏只是下次打开面板还提示一次「需重启」，不影响启动。
+  }
+}
