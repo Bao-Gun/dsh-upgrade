@@ -75,10 +75,17 @@ const PHASE_LABELS: Record<string, string> = {
   rollback: '回滚',
 }
 
+/** 本体进度条按这个顺序折算百分比；直接取 PHASE_LABELS 的顺序，避免两处清单漂移。 */
+const HOST_PHASES: readonly string[] = Object.keys(PHASE_LABELS).filter(
+  (phase) => phase !== 'fail' && phase !== 'rollback',
+)
+
 const STYLE_TEXT = [
   '.dshu-overlay{position:fixed;inset:0;z-index:2147483000;display:flex;align-items:center;justify-content:center;padding:24px;background:rgba(0,0,0,.32)}',
-  '.dshu-panel{position:relative;display:flex;flex-direction:column;gap:14px;width:min(560px,100%);max-height:min(80vh,720px);overflow:auto;padding:20px;border-radius:var(--dsw-radius-lg,12px);background:var(--dsw-alias-bg-layer-1,var(--dsw-alias-bg-primary,#fff));color:var(--dsw-alias-label-primary,inherit);box-shadow:0 18px 48px rgba(0,0,0,.24);font:14px/1.55 var(--dsw-font-family,system-ui,sans-serif)}',
-  '.dshu-head{display:flex;align-items:center;justify-content:space-between;gap:12px}',
+  '.dshu-panel{position:relative;display:flex;flex-direction:column;gap:0;width:min(560px,100%);max-height:min(80vh,720px);overflow:hidden;padding:0;border-radius:var(--dsw-radius-lg,12px);background:var(--dsw-alias-bg-layer-1,var(--dsw-alias-bg-primary,#fff));color:var(--dsw-alias-label-primary,inherit);box-shadow:0 18px 48px rgba(0,0,0,.24);font:14px/1.55 var(--dsw-font-family,system-ui,sans-serif)}',
+  // 头部不参与滚动：外壳 overflow:hidden，只有 .dshu-body 滚。
+  '.dshu-head{flex:none;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:18px 20px 12px;border-bottom:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.08))}',
+  '.dshu-body{display:flex;flex-direction:column;gap:14px;min-height:0;overflow:auto;padding:14px 20px 20px}',
   '.dshu-title{font-size:16px;font-weight:600}',
   '.dshu-close{flex:none;width:28px;height:28px;border:none;border-radius:var(--dsw-radius-sm,6px);background:transparent;color:inherit;font-size:18px;line-height:1;cursor:pointer}',
   '.dshu-close:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.06))}',
@@ -113,6 +120,17 @@ const STYLE_TEXT = [
   '.dshu-plugin-state{grid-column:1/2;font-size:12px;color:var(--dsw-alias-label-tertiary,inherit)}',
   '.dshu-plugin-upgrade{grid-row:1/3;grid-column:2/3;align-self:center}',
   '.dshu-plugin-empty,.dshu-plugin-unavailable{color:var(--dsw-alias-label-secondary,inherit)}',
+  '.dshu-plugin-state[data-error]{color:var(--dsw-alias-state-error-primary,#e5484d)}',
+  // 进度条：有百分比就定宽，没有就左右来回跑（pnpm 还没给总量）。
+  '.dshu-bar{grid-column:1/3;height:4px;border-radius:2px;background:var(--dsw-alias-border-l2,rgba(0,0,0,.1));overflow:hidden}',
+  '.dshu-bar[hidden]{display:none}',
+  '.dshu-bar-fill{height:100%;width:0;background:var(--dsw-alias-state-business-primary,#4d6bfe);transition:width .25s ease}',
+  '.dshu-bar[data-indeterminate] .dshu-bar-fill{width:38%;animation:dshu-slide 1.1s ease-in-out infinite}',
+  '@keyframes dshu-slide{0%{margin-left:-38%}100%{margin-left:100%}}',
+  '@media (prefers-reduced-motion:reduce){.dshu-bar[data-indeterminate] .dshu-bar-fill{animation:none;margin-left:0;width:100%;opacity:.4}}',
+  '.dshu-host-bar{height:4px;border-radius:2px;background:var(--dsw-alias-border-l2,rgba(0,0,0,.1));overflow:hidden}',
+  '.dshu-host-bar[hidden]{display:none}',
+  '.dshu-host-bar .dshu-bar-fill{height:100%;width:0;background:var(--dsw-alias-state-business-primary,#4d6bfe);transition:width .25s ease}',
   '.dshu-progress{display:flex;flex-direction:column;gap:4px;padding:10px;border-radius:var(--dsw-radius-sm,6px);background:var(--dsw-alias-bg-layer-2,rgba(0,0,0,.03));font-size:13px}',
   '.dshu-progress[hidden]{display:none}',
   '.dshu-progress-line::before{content:"› ";color:var(--dsw-alias-label-tertiary,inherit)}',
@@ -149,11 +167,16 @@ type View = {
   options: PanelOptions
   overlay: HTMLElement
   panel: HTMLElement
+  /** 头部固定，滚动只发生在这里。 */
+  body: HTMLElement
   hostSection: HTMLElement
   pluginsSection: HTMLElement
   hostVersions: HTMLElement
   hostActions: HTMLElement
   releaseBox: HTMLElement
+  /** 本体升级的阶段进度条；没有升级时整个隐藏。 */
+  hostBar: HTMLElement
+  hostFill: HTMLElement
   pluginHead: HTMLElement
   pluginList: HTMLElement
   progress: HTMLElement
@@ -443,6 +466,10 @@ function buildView(doc: Document, options: PanelOptions): View {
   hostTitle.textContent = '本体'
   const hostVersions = element(doc, 'div', 'dshu-versions')
   const hostActions = element(doc, 'div', 'dshu-host-actions')
+  const hostBar = element(doc, 'div', 'dshu-host-bar')
+  hostBar.hidden = true
+  const hostFill = element(doc, 'div', 'dshu-bar-fill')
+  hostBar.appendChild(hostFill)
   const releaseBox = element(doc, 'div', 'dshu-release')
   releaseBox.hidden = true
   const hostRow = element(doc, 'div', 'dshu-row')
@@ -453,7 +480,7 @@ function buildView(doc: Document, options: PanelOptions): View {
   toggleLabel.append(prerelease, doc.createTextNode('显示预发布版本'))
   const refreshButton = buttonOf(doc, 'dshu-refresh', '重新检查')
   hostRow.append(toggleLabel, refreshButton)
-  hostSection.append(hostTitle, hostVersions, hostActions, releaseBox, hostRow)
+  hostSection.append(hostTitle, hostVersions, hostBar, hostActions, releaseBox, hostRow)
 
   const pluginsSection = element(doc, 'section', 'dshu-section')
   pluginsSection.setAttribute('data-k', 'plugins')
@@ -467,7 +494,10 @@ function buildView(doc: Document, options: PanelOptions): View {
   const notice = element(doc, 'div', 'dshu-notice')
   notice.hidden = true
 
-  panel.append(head, hostSection, pluginsSection, progress, notice)
+  // 头部独立于滚动区：面板自己不滚，只有 body 滚，标题与关闭按钮永远在原位。
+  const body = element(doc, 'div', 'dshu-body')
+  body.append(hostSection, pluginsSection, progress, notice)
+  panel.append(head, body)
   overlay.appendChild(panel)
 
   const view: View = {
@@ -475,11 +505,14 @@ function buildView(doc: Document, options: PanelOptions): View {
     options,
     overlay,
     panel,
+    body,
     hostSection,
     pluginsSection,
     hostVersions,
     hostActions,
     releaseBox,
+    hostBar,
+    hostFill,
     pluginHead,
     pluginList,
     progress,
@@ -577,7 +610,7 @@ function showError(view: View, text: string): void {
   if (view.error === null) {
     const bar = element(view.doc, 'div', 'dshu-error')
     bar.setAttribute('role', 'alert')
-    view.panel.insertBefore(bar, view.progress)
+    view.body.insertBefore(bar, view.progress)
     view.error = bar
   }
   view.error.textContent = text
@@ -608,6 +641,25 @@ function addProgress(view: View, text: string): void {
   view.progress.hidden = false
   const line = element(view.doc, 'div', 'dshu-progress-line', text)
   view.progress.appendChild(line)
+}
+
+/** 阶段未知（比如服务端加了新阶段）就画不确定进度，别报一个假百分比。 */
+function setHostProgress(view: View, phase: string): void {
+  view.hostBar.hidden = false
+  const index = HOST_PHASES.indexOf(phase)
+  if (index < 0) {
+    view.hostBar.setAttribute('data-indeterminate', '')
+    view.hostFill.style.width = ''
+    return
+  }
+  view.hostBar.removeAttribute('data-indeterminate')
+  view.hostFill.style.width = String(Math.round(((index + 1) / HOST_PHASES.length) * 100)) + '%'
+}
+
+function hideHostProgress(view: View): void {
+  view.hostBar.hidden = true
+  view.hostBar.removeAttribute('data-indeterminate')
+  view.hostFill.style.width = '0'
 }
 
 function renderSurvey(view: View): void {
@@ -769,23 +821,61 @@ function renderPlugins(view: View): void {
     return
   }
   for (const update of plugins.updatable) {
-    view.pluginList.appendChild(createPluginRow(view, update))
+    view.pluginList.appendChild(createPluginRow(view, update).root)
   }
 }
 
-function createPluginRow(view: View, update: PluginUpdate): HTMLElement {
+/** 一行插件需要的全部节点：状态与失败原因都写在这一行里，不往面板底部抛。 */
+type PluginRowView = {
+  root: HTMLElement
+  state: HTMLElement
+  bar: HTMLElement
+  fill: HTMLElement
+  button: HTMLButtonElement
+}
+
+function createPluginRow(view: View, update: PluginUpdate): PluginRowView {
   const doc = view.doc
-  const row = element(doc, 'div', 'dshu-plugin')
-  row.setAttribute('data-name', update.name)
+  const root = element(doc, 'div', 'dshu-plugin')
+  root.setAttribute('data-name', update.name)
   const name = element(doc, 'div', 'dshu-plugin-name', update.name)
   const version = element(doc, 'div', 'dshu-plugin-version', update.from + ' → ' + update.to)
   const state = element(doc, 'div', 'dshu-plugin-state')
-  const upgrade = buttonOf(doc, 'dshu-plugin-upgrade', '升级')
-  upgrade.addEventListener('click', () => {
-    void runPluginUpdate(view, update, upgrade, state)
+  const bar = element(doc, 'div', 'dshu-bar')
+  bar.hidden = true
+  const fill = element(doc, 'div', 'dshu-bar-fill')
+  bar.appendChild(fill)
+  const button = buttonOf(doc, 'dshu-plugin-upgrade', '升级')
+  const row: PluginRowView = { root, state, bar, fill, button }
+  button.addEventListener('click', () => {
+    void runPluginUpdate(view, update, row)
   })
-  row.append(name, version, state, upgrade)
+  root.append(name, version, state, bar, button)
   return row
+}
+
+/** 行内状态：失败用红字，并且清掉上一轮的进度条。 */
+function setRowState(row: PluginRowView, text: string, isError = false): void {
+  row.state.textContent = text
+  if (isError) row.state.setAttribute('data-error', '')
+  else row.state.removeAttribute('data-error')
+}
+
+/** percent 为 null 表示 pnpm 还没报总量：画不确定进度（来回跑），不假装 0%。 */
+function setRowProgress(row: PluginRowView, percent: number | null, visible: boolean): void {
+  row.bar.hidden = !visible
+  if (!visible) {
+    row.bar.removeAttribute('data-indeterminate')
+    row.fill.style.width = '0'
+    return
+  }
+  if (percent === null) {
+    row.bar.setAttribute('data-indeterminate', '')
+    row.fill.style.width = ''
+    return
+  }
+  row.bar.removeAttribute('data-indeterminate')
+  row.fill.style.width = String(percent) + '%'
 }
 
 async function loadHost(
@@ -910,6 +1000,8 @@ async function runHostUpgrade(view: View, token: number): Promise<void> {
 }
 
 function finishHostBusy(view: View): void {
+  // 本体这一轮到此结束（含预检与重启请求），阶段条收起来，剩下的用文字进度说话。
+  hideHostProgress(view)
   view.upgradeBusy = false
   view.prerelease.disabled = false
   view.refreshButton.disabled = false
@@ -933,6 +1025,7 @@ async function consumeUpgrade(view: View, token: number, response: Response, tar
         return
       }
       if (event.done === true) sawDone = true
+      if (phase !== '') setHostProgress(view, phase)
       if (phase === 'done') {
         addProgress(view, phaseLabel('done'))
         return
@@ -941,16 +1034,19 @@ async function consumeUpgrade(view: View, token: number, response: Response, tar
     })
   } catch {
     if (!live(view, token)) return
+    hideHostProgress(view)
     showError(view, '升级进度读到一半断了，请刷新后确认结果')
     return
   }
   if (!live(view, token)) return
 
   if (failure !== null) {
+    hideHostProgress(view)
     showError(view, failure)
     return
   }
   if (!sawDone) {
+    hideHostProgress(view)
     showError(view, '升级没有正常结束，请刷新后确认结果')
     return
   }
@@ -1063,20 +1159,20 @@ async function continueToRestart(view: View, token: number, target: string): Pro
 async function runPluginUpdate(
   view: View,
   update: PluginUpdate,
-  button: HTMLButtonElement,
-  state: HTMLElement,
+  row: PluginRowView,
 ): Promise<void> {
   const token = view.token
-  button.disabled = true
-  state.textContent = '正在升级…'
+  row.button.disabled = true
+  setRowState(row, '正在升级…')
+  setRowProgress(row, null, true)
   try {
     const f = fetchOf(view.doc)
     const base = view.options.apiBase ?? ''
     const started = await startPluginUpdate(update.name, f, base)
     if (!live(view, token)) return
     if (started.operationId === '') {
-      handlePluginStartFailure(view, started.code, started.message, state)
-      button.disabled = false
+      handlePluginStartFailure(row, started.code, started.message)
+      row.button.disabled = false
       return
     }
 
@@ -1085,60 +1181,97 @@ async function runPluginUpdate(
       const operation = await pollPluginOperation(started.operationId, f, base)
       if (!live(view, token)) return
       if (operation.status === 'queued' || operation.status === 'running') {
+        paintPluginRunning(row, operation)
         await sleep(interval)
         if (!live(view, token)) return
         continue
       }
-      handlePluginOperation(view, operation, state)
-      button.disabled = false
+      handlePluginOperation(row, operation)
+      row.button.disabled = false
       return
     }
-    state.textContent = '升级超时，稍后重试'
-    showError(view, update.name + ' 升级超时，请刷新后确认结果')
-    button.disabled = false
+    setRowState(row, '升级超时，稍后重试', true)
+    setRowProgress(row, null, false)
+    row.button.disabled = false
   } catch {
     if (!live(view, token)) return
-    state.textContent = '升级失败'
-    showError(view, '插件升级请求失败，请稍后重试')
-    button.disabled = false
+    setRowState(row, '插件升级请求失败，请稍后重试', true)
+    setRowProgress(row, null, false)
+    row.button.disabled = false
   }
 }
 
-/** 请求层不可用（市场没开、登录失效、记录丢失）不算安装失败，不写红条。 */
-function handlePluginStartFailure(
-  view: View,
-  code: string | undefined,
-  message: string | undefined,
-  state: HTMLElement,
-): void {
-  if (isPluginUnavailableCode(code)) {
-    state.textContent = '插件更新不可用'
+/** 运行中：状态写 pnpm 给的那一句，进度条按真实百分比走。 */
+function paintPluginRunning(row: PluginRowView, operation: PluginOperation): void {
+  const progress = operation.progress
+  if (operation.status === 'queued') {
+    const wait = operation.wait
+    const waiting =
+      wait !== undefined && wait.activeAgentIds.length > 0
+        ? '排队中，等 ' + String(wait.activeAgentIds.length) + ' 个运行中的会话结束'
+        : '排队中…'
+    setRowState(row, wait !== undefined && wait.message !== null ? wait.message : waiting)
+    setRowProgress(row, null, true)
     return
   }
-  state.textContent = '升级失败'
-  showError(view, message !== undefined && message !== '' ? message : '插件升级失败')
+  const detail = progress?.detail ?? null
+  const percent = progress?.percent ?? null
+  const text =
+    detail !== null
+      ? detail
+      : percent !== null
+        ? '正在升级…' + String(percent) + '%'
+        : '正在升级…'
+  setRowState(row, text)
+  setRowProgress(row, percent, true)
 }
 
-function handlePluginOperation(view: View, operation: PluginOperation, state: HTMLElement): void {
+/**
+ * 请求层不可用（市场没开、登录失效、记录丢失）不算安装失败，也不写红字；
+ * 真失败把宿主的原因写进这一行——七个插件一起升级时底部一条红条认不出是谁。
+ */
+function handlePluginStartFailure(
+  row: PluginRowView,
+  code: string | undefined,
+  message: string | undefined,
+): void {
+  if (isPluginUnavailableCode(code)) {
+    setRowState(row, '插件更新不可用')
+    setRowProgress(row, null, false)
+    return
+  }
+  setRowState(row, message !== undefined && message !== '' ? '升级失败：' + message : '升级失败', true)
+  setRowProgress(row, null, false)
+}
+
+function handlePluginOperation(row: PluginRowView, operation: PluginOperation): void {
+  setRowProgress(row, null, false)
   switch (operation.status) {
     case 'succeeded':
-      state.textContent = '已升级'
-      if (operation.restartRequired) setNotice(view, '插件已升级，重启 DSH 后生效')
+      setRowState(row, operation.restartRequired ? '已升级，重启 DSH 后生效' : '已升级')
       return
     case 'failed':
       if (isPluginUnavailableCode(operation.code)) {
-        state.textContent = '插件更新不可用'
+        setRowState(row, '插件更新不可用')
         return
       }
-      state.textContent = '升级失败'
-      showError(view, operation.message !== undefined && operation.message !== '' ? operation.message : '插件升级失败')
+      setRowState(
+        row,
+        operation.message !== undefined && operation.message !== '' ? '升级失败：' + operation.message : '升级失败',
+        true,
+      )
       return
     case 'cancelled':
-      state.textContent = '已取消'
+      setRowState(row, '已取消')
       return
     case 'rolled-back':
-      state.textContent = '已回滚'
-      showError(view, operation.message !== undefined && operation.message !== '' ? operation.message : '插件升级失败，已回滚')
+      setRowState(
+        row,
+        operation.message !== undefined && operation.message !== ''
+          ? '升级失败，已回滚：' + operation.message
+          : '升级失败，已回滚',
+        true,
+      )
       return
     default:
       return

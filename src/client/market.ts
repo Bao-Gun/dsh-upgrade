@@ -78,9 +78,32 @@ export type StartedPluginUpdate = {
   message?: string
 }
 
+/**
+ * dshmarket 在 running 状态会给的结构化进度（pnpm 给的）：
+ * percent 只在 total 有值时才是个数，否则为 null——那时按不确定进度画。
+ */
+export type PluginProgress = {
+  percent: number | null
+  phase: string | null
+  detail: string | null
+  done: number | null
+  total: number | null
+}
+
+/** 排队中宿主给出的解释（为什么还没开跑）。 */
+export type PluginWait = {
+  code: string | null
+  message: string | null
+  activeAgentIds: string[]
+}
+
 export type PluginOperation = {
   status: PluginOperationStatus
   restartRequired: boolean
+  /** running 时有；其它状态可能缺。 */
+  progress?: PluginProgress
+  /** queued 且有解释时有。 */
+  wait?: PluginWait
   /**
    * failed 的分类：宿主 failure.code 表示安装真失败；请求层另有
    * MARKET_UNAVAILABLE / OPERATION_UNKNOWN / MARKET_UNAUTHORIZED。
@@ -112,6 +135,48 @@ function isOperationStatus(value: unknown): value is PluginOperationStatus {
 /** base 是 origin 或部署前缀；常量路径自带 /dsh-market，不能再补一次。 */
 function withBase(base: string, path: string): string {
   return base.replace(/\/+$/, '') + path
+}
+
+function numberOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+/**
+ * 进度是可选的：字段缺失或类型不对就整块当作没有，而不是画一条 0% 的假进度。
+ * percent 在 total 为 null 时是 null——那代表 pnpm 还在跑但没有总量。
+ */
+function normalizeProgress(value: unknown): PluginProgress | undefined {
+  if (!isRecord(value)) return undefined
+  const wait: PluginProgress = {
+    percent: numberOrNull(value.percent),
+    phase: typeof value.phase === 'string' && value.phase !== '' ? value.phase : null,
+    detail: typeof value.detail === 'string' && value.detail !== '' ? value.detail : null,
+    done: numberOrNull(value.done),
+    total: numberOrNull(value.total),
+  }
+  if (wait.percent === null && wait.phase === null && wait.detail === null) return undefined
+  if (wait.percent !== null) {
+    const clamped = Math.min(100, Math.max(0, Math.round(wait.percent)))
+    wait.percent = clamped
+  }
+  return wait
+}
+
+function normalizeWait(value: unknown): PluginWait | undefined {
+  if (!isRecord(value)) return undefined
+  const ids: string[] = []
+  if (Array.isArray(value.activeAgentIds)) {
+    for (const item of value.activeAgentIds) {
+      if (typeof item === 'string' && item !== '') ids.push(item)
+    }
+  }
+  const wait: PluginWait = {
+    code: typeof value.code === 'string' && value.code !== '' ? value.code : null,
+    message: typeof value.message === 'string' && value.message !== '' ? value.message : null,
+    activeAgentIds: ids,
+  }
+  if (wait.code === null && wait.message === null && ids.length === 0) return undefined
+  return wait
 }
 
 function unavailableUpdates(): PluginUpdates {
@@ -330,6 +395,10 @@ export async function pollPluginOperation(
       status: operation.state,
       restartRequired: outcome.restartRequired === true,
     }
+    const progress = normalizeProgress(operation.progress)
+    if (progress !== undefined) result.progress = progress
+    const wait = normalizeWait(operation.wait)
+    if (wait !== undefined) result.wait = wait
     const failure = isRecord(operation.failure) ? operation.failure : null
     if (failure !== null) {
       if (typeof failure.code === 'string' && failure.code !== '') result.code = failure.code

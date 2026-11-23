@@ -63,6 +63,35 @@ function streamResponse(chunks: string[], status = 200): FakeResponse {
   }
 }
 
+/** 手动推的流：用来在流没结束时断言进度条上的中间状态。 */
+function controlledStream(): { response: FakeResponse, push: (text: string) => void, close: () => void } {
+  const encoder = new TextEncoder()
+  let controller: ReadableStreamDefaultController<Uint8Array> | null = null
+  const chunks: string[] = []
+  const stream = new ReadableStream<Uint8Array>({
+    start(inner) {
+      controller = inner
+    },
+  })
+  const response: FakeResponse = {
+    ok: true,
+    status: 200,
+    body: stream,
+    json: async () => null,
+    text: async () => chunks.join(''),
+  }
+  return {
+    response,
+    push(text: string) {
+      chunks.push(text)
+      controller?.enqueue(encoder.encode(text))
+    },
+    close() {
+      controller?.close()
+    },
+  }
+}
+
 /** routes 的键是 "METHOD /path"。没命中的路由回 404。 */
 function serve(routes: Record<string, (init: FakeInit) => FakeResponse>): Call[] {
   const calls: Call[] = []
@@ -368,7 +397,7 @@ describe('插件段', () => {
     closePanel()
   })
 
-  test('插件升级真失败时显示宿主自己的 message', async () => {
+  test('插件升级真失败时把宿主 message 写在这一行，不写底部红条', async () => {
     let polls = 0
     serve({
       ...fullRoutes(),
@@ -389,8 +418,106 @@ describe('插件段', () => {
     await openPanel(document, { pollIntervalMs: 1 })
     document.querySelector<HTMLButtonElement>('.dshu-plugin-upgrade')?.click()
 
-    await waitFor(() => (document.querySelector('.dshu-error')?.textContent ?? '').includes('磁盘写满'))
-    expect(errorBar()?.textContent ?? '').toContain('磁盘写满')
+    // 七个插件一起升时，底部一条红条认不出是谁失败；原因必须落在这一行里。
+    await waitFor(() => (pluginsSection()?.textContent ?? '').includes('磁盘写满'))
+    const row = document.querySelector('.dshu-plugin')
+    expect(row?.textContent).toContain('升级失败：磁盘写满，插件安装失败')
+    expect(row?.querySelector('.dshu-plugin-state')?.hasAttribute('data-error')).toBe(true)
+    expect(errorBar()).toBeNull()
+
+    closePanel()
+  })
+
+  test('插件回滚也写在这一行，并明确说了已回滚', async () => {
+    serve({
+      ...fullRoutes(),
+      'POST /dsh-market/api/v1/updates': () => jsonResponse({ schema: 1, operation: { operationId: 'op-1' } }),
+      'GET /dsh-market/api/v1/operations': () =>
+        jsonResponse({
+          operation: {
+            state: 'rolled-back',
+            operationId: 'op-1',
+            failure: { code: 'VERSION_MISMATCH', message: '装完版本对不上', retryable: false },
+          },
+        }),
+    })
+
+    await openPanel(document, { pollIntervalMs: 1 })
+    document.querySelector<HTMLButtonElement>('.dshu-plugin-upgrade')?.click()
+
+    await waitFor(() => (pluginsSection()?.textContent ?? '').includes('已回滚'))
+    expect(pluginsSection()?.textContent).toContain('升级失败，已回滚：装完版本对不上')
+    expect(errorBar()).toBeNull()
+
+    closePanel()
+  })
+
+  test('插件运行中把 pnpm 的进度画在这一行的进度条上', async () => {
+    let polls = 0
+    serve({
+      ...fullRoutes(),
+      'POST /dsh-market/api/v1/updates': () => jsonResponse({ schema: 1, operation: { operationId: 'op-1' } }),
+      'GET /dsh-market/api/v1/operations': () => {
+        polls += 1
+        if (polls === 1) {
+          return jsonResponse({
+            operation: {
+              state: 'running',
+              operationId: 'op-1',
+              progress: { percent: 42.6, detail: '正在解析依赖', phase: 'resolving' },
+            },
+          })
+        }
+        return jsonResponse({ operation: { state: 'running', operationId: 'op-1' } })
+      },
+    })
+
+    await openPanel(document, { pollIntervalMs: 50 })
+    document.querySelector<HTMLButtonElement>('.dshu-plugin-upgrade')?.click()
+
+    await waitFor(() => (pluginsSection()?.textContent ?? '').includes('正在解析依赖'))
+    const bar = document.querySelector<HTMLElement>('.dshu-plugin .dshu-bar')
+    expect(bar?.hidden).toBe(false)
+    // 42.6 取整成 43：宽度只写整数百分比，免得 style 里出现小数。
+    expect(document.querySelector<HTMLElement>('.dshu-plugin .dshu-bar-fill')?.style.width).toBe('43%')
+
+    closePanel()
+  })
+})
+
+describe('面板布局：头部固定、内容区滚动', () => {
+  test('head 与 body 是兄弟节点，两段与错误条都在 body 里', async () => {
+    serve(fullRoutes())
+
+    await openPanel(document)
+
+    const panel = document.querySelector('.dshu-panel')
+    const head = document.querySelector('.dshu-head')
+    const body = document.querySelector('.dshu-body')
+    expect(head).not.toBeNull()
+    expect(body).not.toBeNull()
+    // 头部直接挂在面板上，不跟着内容滚；滚动容器只有 body。
+    expect(head?.parentElement).toBe(panel)
+    expect(body?.parentElement).toBe(panel)
+    expect(body?.querySelector('.dshu-section[data-k="host"]')).not.toBeNull()
+    expect(body?.querySelector('.dshu-section[data-k="plugins"]')).not.toBeNull()
+    expect(body?.querySelector('.dshu-progress')).not.toBeNull()
+
+    closePanel()
+  })
+
+  test('本体升级失败的红条也在 body 里，头部不动', async () => {
+    serve({
+      ...fullRoutes(),
+      'POST /dsh-upgrade/api/upgrade': () => jsonResponse({ code: 'NO_SPACE', message: '磁盘剩余空间不足' }, 400),
+    })
+
+    await openPanel(document)
+    upgradeButton()?.click()
+
+    await waitFor(() => errorBar() !== null)
+    expect(document.querySelector('.dshu-body .dshu-error')).not.toBeNull()
+    expect(errorBar()?.textContent).toContain('磁盘剩余空间不足')
 
     closePanel()
   })
@@ -423,6 +550,78 @@ describe('本体升级的 NDJSON 进度', () => {
     expect(upgradeCalls[0]?.body).toEqual({ target: '0.2.3-alpha.2' })
     // 重启链没接上：一次 restart 请求都不该发。
     expect(callsTo(calls, 'POST', '/dsh-restart/api/restart')).toHaveLength(0)
+
+    closePanel()
+  })
+
+  test('阶段进度条按 backup→install→done 推进，结束时收起', async () => {
+    let stream: ReturnType<typeof controlledStream> | null = null
+    serve({
+      ...fullRoutes(),
+      'POST /dsh-upgrade/api/upgrade': () => {
+        stream = controlledStream()
+        return stream.response
+      },
+      'GET /dsh-restart/api/status': () => jsonResponse({ code: 'NOT_FOUND', message: '没有这个插件' }, 404),
+    })
+
+    const fillOf = (): string =>
+      document.querySelector<HTMLElement>('.dshu-host-bar .dshu-bar-fill')?.style.width ?? ''
+    const barOf = (): HTMLElement | null => document.querySelector<HTMLElement>('.dshu-host-bar')
+    // 在箭头函数里读才拿得到声明类型：直接读会被 TS 收窄成 null 之外的空联合。
+    const liveStream = (): ReturnType<typeof controlledStream> => {
+      if (stream === null) throw new Error('升级请求还没发出去')
+      return stream
+    }
+    const push = (text: string): void => liveStream().push(text)
+
+    await openPanel(document)
+    expect(barOf()?.hidden).toBe(true)
+    upgradeButton()?.click()
+
+    await waitFor(() => stream !== null)
+    push('{"phase":"backup","message":"正在备份"}\n')
+    // backup 是第 1/6 个阶段：17%。阶段名与顺序取自 PHASE_LABELS，不另抄一份。
+    await waitFor(() => fillOf() === '17%')
+
+    push('{"phase":"install"}\n')
+    await waitFor(() => fillOf() === '50%')
+
+    push('{"phase":"done","done":true}\n')
+    await waitFor(() => fillOf() === '100%')
+    // 流不关，consumeUpgrade 就一直等下一行，走不到「已升级」那步。
+    liveStream().close()
+
+    await waitFor(() => noticeText().includes('需手动重启'))
+    // 本体这一轮结束（含预检/重启请求）后把阶段条收起来，别留个 100% 骗人。
+    expect(barOf()?.hidden).toBe(true)
+
+    closePanel()
+  })
+
+  test('未知阶段画不确定进度，不报假百分比', async () => {
+    let stream: ReturnType<typeof controlledStream> | null = null
+    serve({
+      ...fullRoutes(),
+      'POST /dsh-upgrade/api/upgrade': () => {
+        stream = controlledStream()
+        return stream.response
+      },
+      'GET /dsh-restart/api/status': () => jsonResponse({ code: 'NOT_FOUND' }, 404),
+    })
+
+    await openPanel(document)
+    upgradeButton()?.click()
+    await waitFor(() => stream !== null)
+    // 同一个收窄陷阱：在箭头函数里读才拿得到声明类型。
+    const liveStream = (): ReturnType<typeof controlledStream> => {
+      if (stream === null) throw new Error('升级请求还没发出去')
+      return stream
+    }
+    liveStream().push('{"phase":"fetching"}\n')
+
+    await waitFor(() => document.querySelector('.dshu-host-bar')?.hasAttribute('data-indeterminate') === true)
+    expect(document.querySelector<HTMLElement>('.dshu-host-bar .dshu-bar-fill')?.style.width).toBe('')
 
     closePanel()
   })
