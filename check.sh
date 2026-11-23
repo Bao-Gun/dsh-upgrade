@@ -30,14 +30,10 @@ for t in specs/changes/*/tasks.md; do
   fi
 done
 
-# ④ ⚠️ 待补全：测试 / 验收命令 —— 要补成一行能跑的命令（例：`npm test`、`pytest -q`）；补在：下面三行 echo 那里
-# 换的时候删掉 echo 和 fail=1，再按注释里的样子加真命令。
-echo '⚠️ 待补全：测试 / 验收命令还没配（测试 / lint / typecheck 任一都可）' >&2
-echo '   要补成：一行能跑的命令；补在：本文件第 ④ 段' >&2
-fail=1
-# 示例（配好真命令后改用这些形状，一条挂了不挡其它条）：
-#   npm test  || bad "测试失败"
-#   npm run lint || bad "lint 失败"
+# ④ 构建 / 类型检查 / 测试，一条挂了不挡其它条
+npm run build || bad "构建失败"
+npx tsc --noEmit || bad "类型检查失败"
+npm test || bad "测试失败"
 
 if [ "$fail" -eq 0 ]; then echo '✓ 全部通过'; else echo '✗ 有未通过项' >&2; fi
 exit "$fail"
