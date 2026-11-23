@@ -110,13 +110,15 @@ export async function readCache(
   return cache
 }
 
-/** 浅合并：只替换传进来的顶层分区，两个子对象各自整体替换 */
+/**
+ * 字面浅合并：传进来的顶层分区整体替换。显式传 undefined 的键会先写成
+ * undefined，JSON.stringify 随即把它丢掉——所以 writeCache({ registry: undefined })
+ * 就是「删掉 registry 分区、下次强制重新拉」。
+ */
 export async function writeCache(delta: Partial<Cache>): Promise<void> {
   const file = join(rootDir(), CACHE_FILE)
   const previous = (await readJsonRecord(file)) ?? {}
-  const next: Record<string, unknown> = { ...previous }
-  if (delta.registry !== undefined) next.registry = delta.registry
-  if (delta.releases !== undefined) next.releases = delta.releases
+  const next: Record<string, unknown> = { ...previous, ...delta }
   await writeJsonAtomic(file, next)
 }
 
@@ -124,7 +126,9 @@ export async function readPending(): Promise<Pending | null> {
   const raw = await readJsonRecord(join(rootDir(), PENDING_FILE))
   if (raw === null) return null
   const { from, to, startedAt } = raw
-  if (typeof from !== 'string' || typeof to !== 'string') return null
+  if (typeof from !== 'string' || from === '' || typeof to !== 'string' || to === '') {
+    return null
+  }
   if (typeof startedAt !== 'number' || !Number.isFinite(startedAt)) return null
   return { from, to, startedAt }
 }
@@ -144,13 +148,14 @@ export async function readLast(): Promise<Last | null> {
   return { ...raw, running: raw.running === true } as Last
 }
 
-/** 浅合并：没传的字段保持不变 */
+/**
+ * 字面浅合并：没传的字段保持不变；显式传 undefined 的字段会被删掉
+ * （JSON.stringify 丢 undefined）。Task 7 成功路径必须显式传
+ * lastError: undefined，否则上一次失败留下的错误会一直挂在盘上。
+ */
 export async function writeLast(patch: Partial<Last>): Promise<void> {
   const file = join(rootDir(), LAST_FILE)
   const previous = (await readJsonRecord(file)) ?? {}
-  const next: Record<string, unknown> = { ...previous }
-  for (const [key, value] of Object.entries(patch)) {
-    if (value !== undefined) next[key] = value
-  }
+  const next: Record<string, unknown> = { ...previous, ...patch }
   await writeJsonAtomic(file, next)
 }

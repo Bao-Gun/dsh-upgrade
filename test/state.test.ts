@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
-import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -120,6 +120,16 @@ describe('缓存', () => {
     expect(replaced?.releases?.byVersion['0.2.2']?.[0]?.items).toEqual(['修复退出码'])
   })
 
+  test('writeCache({ registry: undefined }) 从文件里删掉 registry', async () => {
+    await writeCache({ registry: registry(), releases: { checkedAt: NOW, byVersion: {} } })
+    await writeCache({ registry: undefined })
+    const raw = JSON.parse(await readFile(join(dir, 'cache.json'), 'utf8')) as Record<string, unknown>
+    expect('registry' in raw).toBe(false)
+    const cached = await readCache(NOW)
+    expect(cached?.registry).toBeUndefined()
+    expect(cached?.releases).not.toBeUndefined()
+  })
+
   test('registry 与 releases 各自按 TTL 过期', async () => {
     await writeCache({
       registry: registry(NOW - 7 * HOUR),
@@ -142,6 +152,13 @@ describe('待通知 marker', () => {
 
   test('文件不存在时 clearPending 不抛', async () => {
     await expect(clearPending()).resolves.toBeUndefined()
+  })
+
+  test('from / to 为空串的 marker 读成 null', async () => {
+    await writePending({ from: '', to: '0.2.2', startedAt: 1 })
+    expect(await readPending()).toBeNull()
+    await writePending({ from: '0.2.1', to: '', startedAt: 1 })
+    expect(await readPending()).toBeNull()
   })
 
   test('形状不对的 marker 读成 null', async () => {
@@ -167,6 +184,21 @@ describe('上次结果', () => {
       running: false,
       lastResult: { to: '0.2.2', at: 111, restartRequired: true },
       lastError: { code: 'UPGRADE_FAILED', message: '网络不通', at: 222 },
+    })
+  })
+
+  test('writeLast({ lastError: undefined }) 从文件里删掉错误字段', async () => {
+    await writeLast({ running: true, lastError: { code: 'UPGRADE_FAILED', message: '网络不通', at: 222 } })
+    await writeLast({
+      running: false,
+      lastResult: { to: '0.2.2', at: 111, restartRequired: true },
+      lastError: undefined,
+    })
+    const raw = JSON.parse(await readFile(join(dir, 'last.json'), 'utf8')) as Record<string, unknown>
+    expect('lastError' in raw).toBe(false)
+    expect(await readLast()).toEqual({
+      running: false,
+      lastResult: { to: '0.2.2', at: 111, restartRequired: true },
     })
   })
 })
