@@ -85,9 +85,21 @@ export function findHostInstallDir(candidates?: string[]): string | null {
   return null
 }
 
+type HostErrorCode =
+  | 'HOST_NOT_FOUND'
+  | 'REGISTRY_FETCH_FAILED'
+  | 'REGISTRY_HTTP_ERROR'
+  | 'REGISTRY_INVALID_JSON'
+  | 'REGISTRY_INVALID_SHAPE'
+
+/** 错误码挂在 Error 自身属性上；共享错误类型由 Task 6 收拢，这里不新增导出。 */
+function codedError(code: HostErrorCode, message: string): Error {
+  return Object.assign(new Error(message), { code })
+}
+
 /** 文案固定：调用方只需要「找不到」，候选列表属于内部实现。 */
 function notFoundError(): Error {
-  return new Error('找不到 DSH 安装目录')
+  return codedError('HOST_NOT_FOUND', '找不到 DSH 安装目录')
 }
 
 export async function readHostInfo(dir?: string): Promise<HostInfo> {
@@ -112,17 +124,28 @@ function packagePath(name: string): string {
 }
 
 async function fetchJson(url: string, fetchImpl: typeof fetch): Promise<unknown> {
-  const response = await fetchImpl(url, {
-    headers: { accept: 'application/json' },
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-  })
+  const networkMessage = '拉取 registry 元数据失败（网络不通或请求超时）'
+  let response: Response
+  try {
+    response = await fetchImpl(url, {
+      headers: { accept: 'application/json' },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    })
+  } catch {
+    // fetch 本身失败（拒连、DNS、超时/abort）：统一成中文文案，不让英文 TypeError 漏出去。
+    throw codedError('REGISTRY_FETCH_FAILED', networkMessage)
+  }
   if (!response.ok) {
-    throw new Error(`拉取 registry 元数据失败（HTTP ${response.status}）`)
+    throw codedError('REGISTRY_HTTP_ERROR', `拉取 registry 元数据失败（HTTP ${response.status}）`)
   }
   try {
     return (await response.json()) as unknown
-  } catch {
-    throw new Error('registry 返回的内容不是合法 JSON')
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw codedError('REGISTRY_INVALID_JSON', 'registry 返回的内容不是合法 JSON')
+    }
+    // 读 body 途中被 abort/超时：不是 JSON 语法问题，按网络失败报。
+    throw codedError('REGISTRY_FETCH_FAILED', '拉取 registry 元数据失败（读取响应内容时中断或超时）')
   }
 }
 
@@ -139,7 +162,7 @@ function channelsOf(tags: Record<string, unknown>): RegistryInfo['channels'] {
 }
 
 function parseRegistry(payload: unknown): RegistryInfo {
-  if (!isRecord(payload)) throw new Error('registry 返回的结构无法识别')
+  if (!isRecord(payload)) throw codedError('REGISTRY_INVALID_SHAPE', 'registry 返回的结构无法识别')
   const rawVersions = isRecord(payload.versions) ? payload.versions : {}
   const rawTime = isRecord(payload.time) ? payload.time : {}
   const rawTags = isRecord(payload['dist-tags']) ? payload['dist-tags'] : {}

@@ -45,6 +45,22 @@ function stubFetch(body: unknown, status = 200) {
   )
 }
 
+type Failure = { code?: string; message: string }
+
+/** 断言抛错时同时拿到 code 与中文文案；契约要求两者都在 Error 自身上。 */
+async function failureOf(promise: Promise<unknown>): Promise<Failure> {
+  try {
+    await promise
+  } catch (error) {
+    const coded = error as { code?: unknown; message?: unknown }
+    return {
+      code: typeof coded.code === 'string' ? coded.code : undefined,
+      message: typeof coded.message === 'string' ? coded.message : '',
+    }
+  }
+  throw new Error('预期抛错，实际成功')
+}
+
 function registryPayload() {
   return {
     'dist-tags': { latest: '0.2.2-rc.5', next: '0.2.2-rc.5', alpha: '0.2.3-alpha.2' },
@@ -95,13 +111,17 @@ describe('readHostInfo', () => {
     await expect(readHostInfo(install)).resolves.toEqual({ dir: install, version: '0.2.2-rc.5' })
   })
 
-  test('目录不存在时抛「找不到 DSH 安装目录」', async () => {
-    await expect(readHostInfo(join(dir, 'missing'))).rejects.toThrow('找不到 DSH 安装目录')
+  test('目录不存在时抛 HOST_NOT_FOUND，文案保持「找不到 DSH 安装目录」', async () => {
+    const error = await failureOf(readHostInfo(join(dir, 'missing')))
+    expect(error.code).toBe('HOST_NOT_FOUND')
+    expect(error.message).toBe('找不到 DSH 安装目录')
   })
 
-  test('package.json 不是 dsh 的也抛同一个错', async () => {
+  test('package.json 不是 dsh 的也抛 HOST_NOT_FOUND', async () => {
     const wrong = await writeManifest(join(dir, 'wrong'), { name: 'dsh-upgrade', version: '0.1.0' })
-    await expect(readHostInfo(wrong)).rejects.toThrow('找不到 DSH 安装目录')
+    const error = await failureOf(readHostInfo(wrong))
+    expect(error.code).toBe('HOST_NOT_FOUND')
+    expect(error.message).toBe('找不到 DSH 安装目录')
   })
 })
 
@@ -200,21 +220,69 @@ describe('fetchRegistry', () => {
     expect(result.info).toEqual({ versions: [], channels: {}, publishedAt: {} })
   })
 
-  test('HTTP 非 200 抛错', async () => {
+  test('HTTP 非 200 抛 REGISTRY_HTTP_ERROR', async () => {
     const stub = stubFetch({ error: 'not found' }, 404)
-    await expect(
+    const error = await failureOf(
       fetchRegistry({ fetchImpl: stub as unknown as typeof fetch, now: NOW }),
-    ).rejects.toThrow('404')
+    )
+    expect(error.code).toBe('REGISTRY_HTTP_ERROR')
+    expect(error.message).toContain('404')
   })
 
-  test('拉取失败不写缓存，下一次还会重试', async () => {
+  test('网络失败抛 REGISTRY_FETCH_FAILED、不泄露英文内部错误，且不写缓存', async () => {
     const failing = vi.fn(async () => {
       throw new TypeError('fetch failed')
     })
-    await expect(
+    const error = await failureOf(
       fetchRegistry({ fetchImpl: failing as unknown as typeof fetch, now: NOW }),
-    ).rejects.toThrow('fetch failed')
+    )
+    expect(error.code).toBe('REGISTRY_FETCH_FAILED')
+    expect(error.message).toBe('拉取 registry 元数据失败（网络不通或请求超时）')
+    expect(error.message).not.toContain('fetch failed')
     expect(await readCache(NOW)).toBeNull()
+  })
+
+  test('请求阶段被 abort/超时也归入 REGISTRY_FETCH_FAILED', async () => {
+    const aborted = vi.fn(async () => {
+      throw new DOMException('The operation was aborted.', 'TimeoutError')
+    })
+    const error = await failureOf(
+      fetchRegistry({ fetchImpl: aborted as unknown as typeof fetch, now: NOW }),
+    )
+    expect(error.code).toBe('REGISTRY_FETCH_FAILED')
+    expect(error.message).toBe('拉取 registry 元数据失败（网络不通或请求超时）')
+  })
+
+  test('响应体不是合法 JSON 抛 REGISTRY_INVALID_JSON', async () => {
+    const stub = vi.fn(async () => new Response('not-json', { status: 200 }))
+    const error = await failureOf(
+      fetchRegistry({ fetchImpl: stub as unknown as typeof fetch, now: NOW }),
+    )
+    expect(error.code).toBe('REGISTRY_INVALID_JSON')
+    expect(error.message).toBe('registry 返回的内容不是合法 JSON')
+  })
+
+  test('读响应体途中被 abort/超时归入 REGISTRY_FETCH_FAILED，不误报 JSON 非法', async () => {
+    const response = new Response('{}', { status: 200 })
+    Object.defineProperty(response, 'json', {
+      value: async () => {
+        throw new DOMException('The operation was aborted.', 'AbortError')
+      },
+    })
+    const stub = vi.fn(async () => response)
+    const error = await failureOf(
+      fetchRegistry({ fetchImpl: stub as unknown as typeof fetch, now: NOW }),
+    )
+    expect(error.code).toBe('REGISTRY_FETCH_FAILED')
+    expect(error.message).toBe('拉取 registry 元数据失败（读取响应内容时中断或超时）')
+  })
+
+  test('payload 结构完全无法识别时抛 REGISTRY_INVALID_SHAPE', async () => {
+    const error = await failureOf(
+      fetchRegistry({ fetchImpl: stubFetch([]) as unknown as typeof fetch, now: NOW }),
+    )
+    expect(error.code).toBe('REGISTRY_INVALID_SHAPE')
+    expect(error.message).toBe('registry 返回的结构无法识别')
   })
 })
 
@@ -239,10 +307,12 @@ describe('readTargetManifest', () => {
     ).resolves.toEqual({})
   })
 
-  test('HTTP 非 200 抛错', async () => {
+  test('HTTP 非 200 抛 REGISTRY_HTTP_ERROR', async () => {
     const stub = stubFetch({ error: 'not found' }, 404)
-    await expect(
+    const error = await failureOf(
       readTargetManifest('9.9.9', stub as unknown as typeof fetch),
-    ).rejects.toThrow('404')
+    )
+    expect(error.code).toBe('REGISTRY_HTTP_ERROR')
+    expect(error.message).toContain('404')
   })
 })
