@@ -12,5 +12,5 @@
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src", "test", "tsup.config.ts", "vitest.config.ts"]
+  "include": ["src", "test", "scripts/nas-selftest.ts", "tsup.config.ts", "vitest.config.ts"]
 }
