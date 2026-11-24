@@ -19,7 +19,7 @@ Linux（飞牛 NAS）上「通过索引安装 → 拒绝路径 → 沙箱真升 
 
 ## 验收清单
 
-- [x] 通过索引安装：profile `package.json` 里落成 `github:…#5d53ab6`，`node_modules/dsh-upgrade` 就位（`package.json` 0.2.0，`lib/client.js` + `lib/index.js` 都在）。
+- [x] 通过索引安装：profile `package.json` 里落成 `github:…#5d53ab6`，`node_modules/dsh-upgrade` 就位（`package.json` 0.2.0，`lib/` 下两份构建产物齐全）。
 - [x] 重启后 `/dsh-upgrade/api/status` 返回 200（`current: 0.2.2-rc.5`），页面 `__DSH_BOOT__.entries` 里有 `dsh-upgrade`（`immediately: true`）。
 - [x] 拒绝路径：本体升级返回 `INSTALL_DIR_NOT_WRITABLE`，消息两行且含 `sudo npm i -g --prefix /usr/local`，没有产生新备份、版本没变。
 - [x] 沙箱真升一次：`ok:true`、沙箱里版本从 `0.2.2-rc.4` 变 `0.2.2-rc.5`、`--version` 探针通过、备份已删。

@@ -47,13 +47,13 @@ for a in lib/index.js lib/client.js; do
   [ -f "$a" ] || bad "构建产物缺失: ${a}"
 done
 npx tsc --noEmit || bad "类型检查失败"
-# 先收下输出：既原样打印，也数一遍用例数（防整批用例被删还报绿；下限 289 = 基础 208 + 批量升级/重启链/入口显隐 44 + Linux 适配 37（npm 16 + clone 7 + upgrade 7 + panel 1 + notify 6））
+# 先收下输出：既原样打印，也数一遍用例数（防整批用例被删还报绿；下限 290 = 基础 208 + 批量升级/重启链/入口显隐 44 + Linux 适配 37（npm 16 + clone 7 + upgrade 7 + panel 1 + notify 6）+ 继续升级保留已升级行 1）
 test_out=$(npm test 2>&1); test_rc=$?
 printf '%s\n' "$test_out"
 [ "$test_rc" -eq 0 ] || bad "测试失败"
 passed=$(printf '%s\n' "$test_out" | grep -oE 'Tests +[0-9]+ passed' | grep -oE '[0-9]+' | head -1)
-if [ -n "$passed" ] && [ "$passed" -lt 289 ]; then
-  bad "只跑了 ${passed} 个用例，少于 289（基础 208 + 批量/重启 44 + Linux 适配 37）"
+if [ -n "$passed" ] && [ "$passed" -lt 290 ]; then
+  bad "只跑了 ${passed} 个用例，少于 290（基础 208 + 批量/重启 44 + Linux 适配 37 + 继续升级 1）"
 fi
 
 if [ "$fail" -eq 0 ]; then echo '✓ 全部通过'; else echo '✗ 有未通过项' >&2; fi

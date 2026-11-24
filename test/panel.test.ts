@@ -861,6 +861,31 @@ describe('全部升级', () => {
     closePanel()
   })
 
+  test('「继续升级」只重跑失败的包，已升级那几行的结果留着', async () => {
+    const steps: Record<string, OperationStep[]> = {
+      a: [{ state: 'succeeded' }],
+      b: [{ state: 'failed', failure: { code: 'INSTALL_FAILED', message: '磁盘写满' } }],
+      c: [{ state: 'succeeded' }],
+    }
+    serve(batchRoutes({ packages: ['a', 'b', 'c'], steps }))
+    await openPanel(document, { pollIntervalMs: 10 })
+
+    const button = document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')
+    button?.click()
+    await waitFor(() => button?.textContent === '继续升级')
+    // 首轮收尾：a / c 已升级，b 红字。
+    expect(document.querySelector('[data-name="a"] .dshu-plugin-state')?.textContent).toBe('已升级')
+    expect(document.querySelector('[data-name="c"] .dshu-plugin-state')?.textContent).toBe('已升级')
+
+    steps['b']?.push({ state: 'succeeded' })
+    button?.click()
+    // 同步断言：这一轮只碰 b，a / c 上一轮的结论不能被清掉。
+    expect(document.querySelector('[data-name="a"] .dshu-plugin-state')?.textContent).toBe('已升级')
+    expect(document.querySelector('[data-name="c"] .dshu-plugin-state')?.textContent).toBe('已升级')
+    expect(document.querySelector('[data-name="b"] .dshu-plugin-state')?.textContent).toBe('')
+    closePanel()
+  })
+
   test('本体状态晚到：先点了全部升级，新出的本体按钮也是禁用的', async () => {
     let releaseStatus!: (value: FakeResponse) => void
     const gate = new Promise<FakeResponse>((resolve) => {

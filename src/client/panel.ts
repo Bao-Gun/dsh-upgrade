@@ -1141,7 +1141,8 @@ function setRestartBusy(view: View, busy: boolean): void {
 }
 
 /**
- * 「全部升级」：先把每行清成 pending（上一轮的结果不能留在屏幕上），再串行跑。
+ * 「全部升级」：先把这一轮真要跑的每一行清成 pending，再串行跑。
+ * 只清名单里的行——「继续升级」只重跑失败 / 跳过的包，上一轮已升级的行要留在屏幕上。
  * 事件只改对应名字的那一行；面板关了就停手，剩下的包由 runBatch 记成 skipped。
  */
 async function startBatch(view: View): Promise<void> {
@@ -1152,7 +1153,9 @@ async function startBatch(view: View): Promise<void> {
   const names = view.retryNames.length > 0 ? view.retryNames.slice() : plugins.updatable.map((update) => update.name)
   if (names.length === 0) return
   const token = view.token
-  for (const [name, row] of view.rows) {
+  for (const name of names) {
+    const row = view.rows.get(name)
+    if (row === undefined) continue
     paintBatchItem(row, { name, state: 'pending', percent: null, detail: null, message: null, unavailable: false })
   }
   setBatchBusy(view, true)

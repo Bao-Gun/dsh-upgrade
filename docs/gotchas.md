@@ -23,3 +23,4 @@
 - npm 11 在 Linux 上默认不跑依赖的 install-scripts → 手工 `npm i -g --prefix <p> @deepseek-ai/dsh@<ver>` 会警告 `@deepseek-ai/dsh-subprocess-local, koffi, node-pty, @google/genai, protobufjs` 的 postinstall 被跳过，`dsh --version` 却照常输出（所以探针发现不了） → 排查「装完终端 / 原生模块不对」先看这条警告，需要时 `--allow-scripts=<包名列表>`；插件自己的升级走同一套 npm，遇到同类毛病先怀疑这里而不是版本比对。
 - 重启链的预检偶尔第一次就红 → NAS 上首跑 `POST /dsh-restart/api/precheck` 14.7s 且 `stage: boot, ok: false`（试跑实例 12s 内没打印 Web URL，stdout 混着 MCP 的提示噪声），立刻重跑 10.4s 就 `ok: true, health: true` → 这是 dsh-restart 侧冷启动抖动，不是本插件的判定；`runRestartChain` 读到 `ok:false` 就不重启是正确行为，人看到「预检没过」时先重试一次再判断。
 - 刚重启完的 1～2 秒内 `/health` 已经 200、插件路由却还没注册 → 紧接着 `GET /dsh-upgrade/api/status` 拿到空响应（curl 退出码 7/空 body），等 8 秒再查就正常 → 重启后的自动检查别只看 `/health`，要留重试窗口；`scripts/install.mjs` 的 pollReady 同理，别把第一次空响应当插件挂了。
+- 「继续升级」把上一轮已升级的行刷成空白 → `startBatch` 原来按 `view.rows` 全量 `paintBatchItem` 成 `pending`，可这一轮只跑 `retryNames`（失败的包），已升级那几行清掉后没人再画（复现：a 成功、b 失败 → 点继续升级，a 行变空） → 清 `pending` 只能按这一轮的名单走，不在名单里的行保持上一轮结论。

@@ -33,7 +33,7 @@
 
 ### 插件：全部升级 → runBatch → dshmarket → 汇总 → 可选重启
 
-点「全部升级」→ `panel.startBatch` 先把每行按 `pending` 清空（上一轮文案不残留）→ 名单优先取 `view.retryNames`（上一轮失败 / 跳过的包），没有才取整张可更新表 → `runBatch(names)` 串行：`POST /dsh-market/api/v1/updates {packageName}` 拿 operationId，随后每 `DEFAULT_POLL_INTERVAL_MS`（800ms）`GET /dsh-market/api/v1/operations?operationId=<id>`；非终态发 `running`（percent / detail / 排队原因），终态发 `settled`，一个包到终态才起下一个 → `panel` 只按 `item.name` 把事件画到对应行（`paintBatchItem`）→ 结束后把成功的包从 `plugins.updatable` 摘掉，`paintPluginsHead` 重算标题与按钮：全升完则按钮收起、标题回「插件」；有失败 / 跳过则按钮写「继续升级」（只重试那些包，成功的不再动）→ 写汇总「n 个已升级，m 个失败，k 个跳过（，需重启生效）」，并按 `summary.skipped` 给对应行补「已跳过」（batch 对跳过项不发事件）→ 有成功项时 `offerRestart`：`GET /dsh-restart/api/status` 200 露出「重启 DSH」，404 提示手动重启，其它状态码写明 HTTP 码 → 点按钮第一下只进「确认重启？」，第二下才走 status → precheck → restart。
+点「全部升级」→ `panel.startBatch` 先把这一轮名单里的每行按 `pending` 清空（上一轮文案不残留；不在名单里的行保持原样，「继续升级」不会把上一轮已升级的结论刷掉）→ 名单优先取 `view.retryNames`（上一轮失败 / 跳过的包），没有才取整张可更新表 → `runBatch(names)` 串行：`POST /dsh-market/api/v1/updates {packageName}` 拿 operationId，随后每 `DEFAULT_POLL_INTERVAL_MS`（800ms）`GET /dsh-market/api/v1/operations?operationId=<id>`；非终态发 `running`（percent / detail / 排队原因），终态发 `settled`，一个包到终态才起下一个 → `panel` 只按 `item.name` 把事件画到对应行（`paintBatchItem`）→ 结束后把成功的包从 `plugins.updatable` 摘掉，`paintPluginsHead` 重算标题与按钮：全升完则按钮收起、标题回「插件」；有失败 / 跳过则按钮写「继续升级」（只重试那些包，成功的不再动）→ 写汇总「n 个已升级，m 个失败，k 个跳过（，需重启生效）」，并按 `summary.skipped` 给对应行补「已跳过」（batch 对跳过项不发事件）→ 有成功项时 `offerRestart`：`GET /dsh-restart/api/status` 200 露出「重启 DSH」，404 提示手动重启，其它状态码写明 HTTP 码 → 点按钮第一下只进「确认重启？」，第二下才走 status → precheck → restart。
 
 ### 服务端 → 本机安装目录
 
@@ -62,7 +62,7 @@
 - 文案归数据层，样式归视图层（R30）：`batch.ts` 决定 `message` 与 `unavailable`，`paintBatchItem` 只做 `compactReason` 与红字判定（`failed && !unavailable`）；running 文案按 `message ?? detail ?? '正在升级…N%'`（R36），终态 `message` 已是完整句时不再补「升级失败：」（R38/R42），排队 / 卡住不上红字。
 - 行内进度的显隐必须切整个 `.dshu-plugin-progress`（R41）：只切 `.dshu-bar` 会让进度永远不可见；`percent === null` 时画不确定进度，不假装 0%。
 - `runBatch` 自身不抛：网络异常由 `pollPluginOperation` 收敛成结果对象，`onEvent` 抛错由 `emit` 内部吞掉 —— 单行绘制失败不能打断整批。
-- 批量收尾就地更新可更新表（R52/R53）：成功的包从 `plugins.updatable` 里摘掉再 `paintPluginsHead`，所以「全升完按钮收起、标题回『插件』」不依赖重新查询；失败 / 跳过的包记进 `view.retryNames`，按钮变「继续升级」且只重试这批，已升好的不再 POST。重画列表（新一次查询）会清空 `retryNames`。
+- 批量收尾就地更新可更新表（R52/R53）：成功的包从 `plugins.updatable` 里摘掉再 `paintPluginsHead`，所以「全升完按钮收起、标题回『插件』」不依赖重新查询；失败 / 跳过的包记进 `view.retryNames`，按钮变「继续升级」且只重试这批，已升好的不再 POST，它们那几行的「已升级」也原地留着（清 `pending` 只按这一轮名单走）。重画列表（新一次查询）会清空 `retryNames`。
 - 关闭面板只叫停队列（`cancelled: () => view.closed` 只在每包起包前查一次）：在飞的包仍轮询到终态，结果因 `live()` 为假被丢弃；立刻重开可能撞宿主 `OPERATION_BUSY`。
 - 重启是危险动作，宁可不动：确认要两次分开的点击（首次进入 confirm 态并记 `restartArmedAt`，800ms 内的点击一律忽略，R48）；预检必须读到 `done` 才算通过，空 body / 半截流一律不重启（R49）；非 2xx 的原因依次取 `body.error ?? body.message ?? 纯文本 ?? 「HTTP n」`（R50，dsh-restart 真实契约是 `{ ok:false, error }`）；status 的「404 没装」与「连不上」分开提示。
 - 预检阶段一次只显示一项（R54）：`runRestartChain` 收到 stage 就用 `setNotice` 整段替换蓝色提示框，不往 `.dshu-progress` 追加历史行；读到 `done` 写「重启预检完成」。`POST restart` 成功后立刻 `close(view)`（R55）：服务马上重启，不留一块点不动的面板。
