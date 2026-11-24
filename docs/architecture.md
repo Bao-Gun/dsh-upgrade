@@ -11,8 +11,10 @@
 | 状态 | `src/server/state.ts` | 读写 `~/.dsh/dsh-upgrade/` 下的 cache / pending / last，给出备份目录路径；维护 last 里的「已升级待重启」标记（`readRestartRequired` / `clearRestartRequired`） | `host`、`notify`、`routes`、`tools`、`upgrade`、`index` |
 | 宿主 | `src/server/host.ts` | 找本机全局安装的 dsh（12 层祖先 + 额外目录），拉 npmmirror 的 registry 元数据，读目标版本 manifest 里的 engines | `routes`、`tools`、`index` |
 | 发布 | `src/server/releases.ts` | 拉 GitHub releases 并抽出中文更新内容（`<h3 id="cn-…">` 段），失败只降级、不阻塞升级 | `routes` |
-| 升级 | `src/server/upgrade.ts` | 升级状态机：precheck（engines / 磁盘）→ backup → install（npm i -g）→ verify → rollback；engines 校验在备份之前 | `routes`、`tools` |
-| 通知 | `src/server/notify.ts` | 升级开始前写 pending（R22），下一次启动用 osascript 发「DSH 已升级」并结算，7 天过期；对调用方永不抛 | `routes`（markPending）、`index`（settlePending） |
+| 升级 | `src/server/upgrade.ts` | 升级状态机：precheck（engines / 磁盘 / 安装前缀可写）→ backup（cp 走 `clone` 候选表）→ install（`npm i -g --prefix <prefix>`，前缀从 installDir 推）→ verify → rollback；engines 与可写性校验都在备份之前，写不进去就早退成 `INSTALL_DIR_NOT_WRITABLE`（唯一产物是两行可复制命令），不猜密码、不提权 | `routes`、`tools` |
+| 克隆 | `src/server/clone.ts` | 备份安装目录的 cp 候选表：darwin `-c`（APFS clonefile）→ linux `--reflink=auto`（btrfs/xfs 真 CoW，ext4 自动退化为整拷，GNU cp 没有 `-c`）→ 任何平台兜底 `-R`；绝不硬链接（共享 inode，试跑会写穿线上安装目录）；`upgrade.ts` 的 `moveDirDefault` 是回滚搬回备份的最后兜底，仍硬编码 `cp -R`（有意保留：只求把已存在的树搬回来，不再按平台挑参数） | `upgrade` |
+| npm 前缀 | `src/server/npm.ts` | 从安装目录反推 npm 全局前缀（只认绝对路径且落在 `<prefix>/lib/node_modules/@deepseek-ai/dsh`，相对路径一律 null）、定位 npm 可执行、给子进程 PATH 补 node 目录；平台判定只收在 `clone` / `notify` 两处，本模块只做纯路径推导（平台差异交给 `node:path`）；由 `clone` / `notify` 的调用方把 `process.platform` 传进来，`npm` 的调用方不传 | `upgrade` |
+| 通知 | `src/server/notify.ts` | 升级开始前写 pending（R22），下一次启动发「DSH 已升级」并结算，7 天过期；通知这一处的平台分支：darwin → `osascript` + AppleScript（标题与正文都做双引号转义）、linux → `notify-send`、其它 → 空 argv 静默返回 false；对调用方永不抛 | `routes`（markPending）、`index`（settlePending） |
 | 调查 | `src/server/survey.ts` | 路由和 agent 工具共用的一份判定：当前版本、目标版本、可升级列表、是否被 engines 拦住 | `routes`、`tools` |
 | 单飞锁 | `src/server/lock.ts` | 进程内单飞：HTTP 与 agent 工具同一时刻只允许一个升级在跑 | `routes`、`tools` |
 | 路由 | `src/server/routes.ts` | 四个端点（status / check / releases / upgrade）+ 请求门（方法、`x-dsh-upgrade:1`、同源 Origin）+ NDJSON 进度；status 与 check 都读 last.json，把「装完没重启」报成 `restartRequired`（重查不会把它抹掉）；注册走 `ctx.effect` + `webServer.register` | `index`；页面与 agent 经 HTTP 调用 |
@@ -48,10 +50,13 @@
 ## 关键约束
 
 - engines 校验必须在备份之前（`src/server/upgrade.ts`）：顺序反了会先复制一份用不上的备份，再报 Node 不满足。
+- 安装前缀可写性也要在备份之前（`src/server/upgrade.ts`）：npm 全局安装会写三处 —— installDir、`<prefix>/lib/node_modules`、`<prefix>/bin`（bin 链接），按这个顺序第一个写不进去就报 `INSTALL_DIR_NOT_WRITABLE`。漏查 bin 会在 NAS 上照样晚失败 + 整轮回滚（`npm i -g --prefix` 装包成功、写链接时才 EACCES）。消息固定两行：哪一处不可写 + `sudo npm i -g --prefix <prefix> @deepseek-ai/dsh@<target>`，版本号用本次 target（不是「latest」），面板靠 `.dshu-error` 的 `white-space:pre-line` 保住换行、自己不拼串也不截断。不可写就当场失败，不尝试 `sudo -n`、不读密码、不改安装目录属主。
+- 安装前缀只从 installDir 反推（`src/server/npm.ts`），推不出来就 `INSTALL_FAILED`，绝不退回 npm 自己的 `prefix -g`：NAS 上 `npm prefix -g` 是 `~/.local`，而 dsh 在 `/usr/local`，照 npm 的全局前缀装必然装到别处再被版本校验逮住。推得出的前缀与 installDir 都不是可写性检查的替代品，两者都要过。
 - 安装脚本三步顺序固定：依赖 → 软链 → patch。patch 最后写，中途失败最坏只留「链在配置没认领」，重跑自愈。
 - 所有 HTTP 路由必须过请求门：方法对、带 `x-dsh-upgrade:1`、有 Origin 时与 Host 同源。这是和 dsh-restart 一起硬化的门，改一处要同步另一处。
 - 升级单飞：HTTP 与 agent 工具共用一把锁，第二个请求回 409 BUSY。
-- 备份没成功就不进入安装；回滚顺序固定 removeDir → moveDir。
+- 备份没成功就不进入安装；回滚顺序固定 removeDir → moveDir。备份的 cp 参数只从 `src/server/clone.ts` 的候选表来（政策：平台差异只准出现在 `npm` / `clone` / `notify` 三处；当前实现只有 `clone` / `notify` 收 `process.platform`，`npm` 走 `node:path`）；`scripts/install.mjs` 的 `cloneCandidateList` 是纯 JS 副本，由 `test/clone.test.ts` 动态 import 逐项比对钉住，改表必须同批改两边。
+- 通知是尽力而为（`src/server/notify.ts`）：写 marker、spawn 通知程序、marker 过期或损坏，任何一步失败都只降级成静默，绝不抛、也不影响升级结果；平台差异只在 `notifyCommand` 收口（darwin `osascript`、linux `notify-send`、其它空 argv → false）。
 - 运行期零第三方依赖：服务端只用 Node 内置与宿主注入能力，客户端只用浏览器 API 与 dshmarket v1 协议。
 - 插件批量只串行：dshmarket 没有批量端点，同一时刻只允许一个活动操作 —— 一个包到终态才起下一个；单包失败 / 回滚 / 卡住只记在自己名下，继续后面的包；只有 `cancelled()` 或宿主 `OPERATION_BUSY` 才把剩余记成 skipped 并立即收尾（R32/R40，409 不连报 N 次）。
 - 文案归数据层，样式归视图层（R30）：`batch.ts` 决定 `message` 与 `unavailable`，`paintBatchItem` 只做 `compactReason` 与红字判定（`failed && !unavailable`）；running 文案按 `message ?? detail ?? '正在升级…N%'`（R36），终态 `message` 已是完整句时不再补「升级失败：」（R38/R42），排队 / 卡住不上红字。

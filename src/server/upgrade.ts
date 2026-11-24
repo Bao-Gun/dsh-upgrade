@@ -1,8 +1,11 @@
 import { spawn } from 'node:child_process'
-import { mkdir, readFile, rename, rm, statfs as nodeStatfs } from 'node:fs/promises'
+import { constants, existsSync } from 'node:fs'
+import { access, mkdir, readFile, rename, rm, statfs as nodeStatfs } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { cloneCandidates } from './clone'
 import { readTargetManifest } from './host'
+import { npmBin, npmEnv, npmPrefixOf } from './npm'
 import { backupDir } from './state'
 import { describeEnginesFailure, satisfiesNodeRange } from './versions'
 
@@ -24,11 +27,14 @@ export type UpgradeEvent = {
 
 export type UpgradeDeps = {
   statfs(p: string): Promise<{ bavail: number; bsize: number }>
+  /** 这个路径当前用户写得进去吗；ENOENT / EACCES / 任何异常一律 false，绝不抛出。 */
+  checkWritable(path: string): Promise<boolean>
   cloneDir(src: string, dst: string): Promise<void>
   removeDir(p: string): Promise<void>
   moveDir(src: string, dst: string): Promise<void>
   runNpmInstall(
     target: string,
+    prefix: string,
     timeoutMs: number,
   ): Promise<{ code: number; stdout: string; stderr: string }>
   readInstalledVersion(dir: string): Promise<string | null>
@@ -54,7 +60,7 @@ function errorMessage(error: unknown): string {
 function run(
   command: string,
   args: string[],
-  options: { cwd?: string; timeoutMs?: number } = {},
+  options: { cwd?: string; timeoutMs?: number; env?: NodeJS.ProcessEnv } = {},
 ): Promise<RunResult> {
   return new Promise((resolve) => {
     let stdout = ''
@@ -62,7 +68,10 @@ function run(
     let settled = false
     let timer: NodeJS.Timeout | undefined
 
-    const child = spawn(command, args, options.cwd === undefined ? {} : { cwd: options.cwd })
+    const spawnOptions: { cwd?: string; env?: NodeJS.ProcessEnv } = {}
+    if (options.cwd !== undefined) spawnOptions.cwd = options.cwd
+    if (options.env !== undefined) spawnOptions.env = options.env
+    const child = spawn(command, args, spawnOptions)
 
     const finish = (code: number): void => {
       if (settled) return
@@ -108,20 +117,26 @@ async function statfsOf(path: string): Promise<{ bavail: number; bsize: number }
   return { bavail: Number(stats.bavail), bsize: Number(stats.bsize) }
 }
 
+/** 删目录的默认实现：cloneDir 的中途清理与 removeDir dep 共用这一份，别各写一遍 rm -rf。 */
+async function removeDirDefault(path: string): Promise<void> {
+  await rm(path, { recursive: true, force: true })
+}
+
 /**
- * APFS 上 cp -c 是秒级 clonefile；不支持时退回真复制。
- * 目标目录先删掉，避免残留目录把 cp 变成「往目录里再套一层」。
+ * 备份安装目录：按 cloneCandidates 的候选表逐条试（darwin clonefile / linux reflink / 普通 -R），
+ * 任一条成功即返回；全失败抛最后一条的 stderr。
+ * 目标每次先删掉：残留目录会把 cp 变成「往目录里再套一层」，失败的那条也可能留下半个目录。
  */
 async function cloneDirDefault(src: string, dst: string): Promise<void> {
   await mkdir(dirname(dst), { recursive: true })
-  await rm(dst, { recursive: true, force: true })
-  const cloned = await run('cp', ['-c', '-R', src, dst])
-  if (cloned.code === 0) return
-  await rm(dst, { recursive: true, force: true })
-  const copied = await run('cp', ['-R', src, dst])
-  if (copied.code !== 0) {
-    throw new Error(copied.stderr.trim() === '' ? '复制安装目录失败' : copied.stderr.trim())
+  let lastStderr = ''
+  for (const args of cloneCandidates(process.platform, src, dst)) {
+    await removeDirDefault(dst)
+    const result = await run('cp', args)
+    if (result.code === 0) return
+    lastStderr = result.stderr.trim()
   }
+  throw new Error(lastStderr === '' ? '复制安装目录失败' : lastStderr)
 }
 
 /** 同盘 rename 是原子的；跨设备（EXDEV）才退回复制 + 删源。 */
@@ -138,6 +153,19 @@ async function moveDirDefault(src: string, dst: string): Promise<void> {
     throw new Error(copied.stderr.trim() === '' ? '移动安装目录失败' : copied.stderr.trim())
   }
   await rm(src, { recursive: true, force: true })
+}
+
+/**
+ * 只做判断、不抛：路径不存在（ENOENT）、没权限（EACCES）以及别的意外，
+ * 都当成「写不进去」。检查本身绝不能成为新的崩溃点。
+ */
+async function pathWritable(path: string): Promise<boolean> {
+  try {
+    await access(path, constants.W_OK)
+    return true
+  } catch {
+    return false
+  }
 }
 
 async function readPackageVersion(dir: string): Promise<string | null> {
@@ -160,9 +188,16 @@ async function runProbe(dir: string): Promise<string | null> {
   return first === '' ? null : first
 }
 
-function npmInstall(target: string, timeoutMs: number): Promise<RunResult> {
+function npmInstall(target: string, prefix: string, timeoutMs: number): Promise<RunResult> {
+  const nodeDir = dirname(process.execPath)
+  // --prefix 必须显式给：让 npm 自己决定会在 NAS 上装到 ~/.local（原因见 npmPrefixOf）。
+  // npm 用绝对路径、PATH 补 node 目录，因为 systemd 用户服务拉起的进程未必带着它们。
   // cwd 用临时目录：不在安装目录里跑 npm，免得 cwd 被删/搬走
-  return run('npm', ['i', '-g', `@deepseek-ai/dsh@${target}`], { cwd: tmpdir(), timeoutMs })
+  return run(npmBin(nodeDir, existsSync), ['i', '-g', '--prefix', prefix, `@deepseek-ai/dsh@${target}`], {
+    cwd: tmpdir(),
+    timeoutMs,
+    env: npmEnv(process.env, nodeDir),
+  })
 }
 
 async function targetEngines(version: string): Promise<string | null> {
@@ -172,10 +207,9 @@ async function targetEngines(version: string): Promise<string | null> {
 
 const defaultDeps: UpgradeDeps = {
   statfs: statfsOf,
+  checkWritable: pathWritable,
   cloneDir: cloneDirDefault,
-  removeDir: async (path) => {
-    await rm(path, { recursive: true, force: true })
-  },
+  removeDir: removeDirDefault,
   moveDir: moveDirDefault,
   runNpmInstall: npmInstall,
   readInstalledVersion: readPackageVersion,
@@ -188,6 +222,7 @@ const defaultDeps: UpgradeDeps = {
 function mergeDeps(overrides?: Partial<UpgradeDeps>): UpgradeDeps {
   return {
     statfs: overrides?.statfs ?? defaultDeps.statfs,
+    checkWritable: overrides?.checkWritable ?? defaultDeps.checkWritable,
     cloneDir: overrides?.cloneDir ?? defaultDeps.cloneDir,
     removeDir: overrides?.removeDir ?? defaultDeps.removeDir,
     moveDir: overrides?.moveDir ?? defaultDeps.moveDir,
@@ -258,6 +293,15 @@ export async function runUpgrade(
     })
   }
 
+  // 前缀纯推导、不碰盘；可写性检查接在读到当前版本之后
+  const prefix = npmPrefixOf(installDir)
+  if (prefix === null) {
+    return fail({
+      code: 'INSTALL_FAILED',
+      message: `无法从安装目录推导 npm 全局前缀：${installDir}（期望 <prefix>/lib/node_modules/@deepseek-ai/dsh）`,
+    })
+  }
+
   let from: string | null
   try {
     from = await deps.readInstalledVersion(installDir)
@@ -266,6 +310,28 @@ export async function runUpgrade(
   }
   if (from === null) {
     return fail({ code: 'INSTALL_FAILED', message: '读不到当前安装版本，未做任何改动' })
+  }
+
+  /**
+   * npm i -g --prefix <p> 要写三处：包目录、<p>/lib/node_modules、<p>/bin（bin 链接）。
+   * 顺序固定，第一个写不进去就停——NAS 上 dsh 是 root 装的、admin 不可写，早退胜过
+   * 先备份几百 MB、再装到别处、版本校验不符、整轮回滚。
+   * 唯一产物是两行可以自己复制去跑的命令，第二行用本次 target 而不是「latest」。
+   */
+  for (const path of [installDir, join(prefix, 'lib', 'node_modules'), join(prefix, 'bin')]) {
+    let writable: boolean
+    try {
+      writable = await deps.checkWritable(path)
+    } catch {
+      writable = false
+    }
+    if (writable) continue
+    return fail({
+      code: 'INSTALL_DIR_NOT_WRITABLE',
+      message:
+        `安装目录不可写：${path}（属主不是你），插件无法升级本体。\n` +
+        `手动执行：sudo npm i -g --prefix ${prefix} @deepseek-ai/dsh@${target}`,
+    })
   }
 
   const backup = backupDir(root, from)
@@ -311,7 +377,7 @@ export async function runUpgrade(
 
   let install: RunResult
   try {
-    install = await deps.runNpmInstall(target, NPM_TIMEOUT_MS)
+    install = await deps.runNpmInstall(target, prefix, NPM_TIMEOUT_MS)
   } catch (error) {
     return await rollback({ code: 'INSTALL_FAILED', message: `安装失败：${errorMessage(error)}` })
   }

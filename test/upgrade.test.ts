@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test, vi, type Mock } from 'vitest'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { runUpgrade, type UpgradeEvent } from '../src/server/upgrade'
@@ -20,20 +20,24 @@ type Fixture = {
   runVersionProbe: Mock
   readTargetEngines: Mock
   nodeVersion: Mock
+  checkWritable: Mock
 }
 
+let prefix: string
 let installDir: string
 let root: string
 let events: UpgradeEvent[]
 
 beforeEach(async () => {
-  installDir = await mkdtemp(join(tmpdir(), 'dsh-upgrade-install-'))
+  // 安装目录必须落在 <prefix>/lib/node_modules/@deepseek-ai/dsh 上，前缀才能推出来
+  prefix = await mkdtemp(join(tmpdir(), 'dsh-upgrade-prefix-'))
+  installDir = join(prefix, 'lib', 'node_modules', '@deepseek-ai', 'dsh')
   root = await mkdtemp(join(tmpdir(), 'dsh-upgrade-root-'))
   events = []
 })
 
 afterEach(async () => {
-  await rm(installDir, { recursive: true, force: true })
+  await rm(prefix, { recursive: true, force: true })
   await rm(root, { recursive: true, force: true })
 })
 
@@ -49,6 +53,7 @@ function baseDeps(): Fixture {
     runVersionProbe: vi.fn(async () => TARGET),
     readTargetEngines: vi.fn(async () => null),
     nodeVersion: vi.fn(() => '26.7.0'),
+    checkWritable: vi.fn(async () => true),
   }
 }
 
@@ -101,6 +106,27 @@ describe('runUpgrade 前置校验', () => {
     expect(events.at(-1)?.error?.code).toBe('RUNTIME_UNSUPPORTED')
   })
 
+  test('安装目录推不出前缀：INSTALL_FAILED，不读版本、不备份、不安装', async () => {
+    const deps = baseDeps()
+    // 少了 /lib：不猜前缀，直接失败——让 npm 自己决定前缀在 NAS 上会装到 ~/.local
+    const oddDir = join(prefix, 'node_modules', '@deepseek-ai', 'dsh')
+
+    const result = await runUpgrade({ target: TARGET, installDir: oddDir, root, deps }, emit)
+
+    expect(result.ok).toBe(false)
+    expect(result.error?.code).toBe('INSTALL_FAILED')
+    expect(result.error?.message).toBe(
+      `无法从安装目录推导 npm 全局前缀：${oddDir}（期望 <prefix>/lib/node_modules/@deepseek-ai/dsh）`,
+    )
+    expect(result.rolledBack).toBeUndefined()
+    expect(phases()).toEqual(['precheck', 'fail'])
+    expect(deps.readInstalledVersion).not.toHaveBeenCalled()
+    expect(deps.cloneDir).not.toHaveBeenCalled()
+    expect(deps.removeDir).not.toHaveBeenCalled()
+    expect(deps.moveDir).not.toHaveBeenCalled()
+    expect(deps.runNpmInstall).not.toHaveBeenCalled()
+  })
+
   test('可用空间只有 1 GB 时 NO_SPACE：不备份、不安装', async () => {
     const deps = baseDeps()
     deps.statfs.mockResolvedValue({ bavail: 1024, bsize: MIB })
@@ -113,6 +139,124 @@ describe('runUpgrade 前置校验', () => {
     expect(deps.statfs).toHaveBeenCalledWith(installDir)
     expect(deps.cloneDir).not.toHaveBeenCalled()
     expect(deps.runNpmInstall).not.toHaveBeenCalled()
+  })
+})
+
+describe('runUpgrade 安装目录可写性', () => {
+  /** npm 全局安装要写的另外两处：包放在 <prefix>/lib/node_modules、bin 链接放在 <prefix>/bin。 */
+  const libDir = (): string => join(prefix, 'lib', 'node_modules')
+  const binDir = (): string => join(prefix, 'bin')
+
+  /** 只让列出的路径不可写，其余按可写——用来验「第一个不可写就停」。 */
+  function onlyWritableExcept(deps: Fixture, ...readonly: string[]): void {
+    deps.checkWritable.mockImplementation(async (path: string) => !readonly.includes(path))
+  }
+
+  test('安装目录不可写：INSTALL_DIR_NOT_WRITABLE、两行可复制，第一处就停', async () => {
+    const deps = baseDeps()
+    onlyWritableExcept(deps, installDir)
+
+    const result = await runUpgrade(input(deps), emit)
+
+    expect(result.ok).toBe(false)
+    expect(result.error?.code).toBe('INSTALL_DIR_NOT_WRITABLE')
+    // 版本号用本次 target，两行原文可直接复制执行
+    expect(result.error?.message).toBe(
+      `安装目录不可写：${installDir}（属主不是你），插件无法升级本体。\n` +
+        `手动执行：sudo npm i -g --prefix ${prefix} @deepseek-ai/dsh@${TARGET}`,
+    )
+    expect(result.error?.message.split('\n')).toHaveLength(2)
+    expect(result.error?.message).toContain('sudo npm i -g --prefix')
+    expect(result.rolledBack).toBeUndefined()
+    expect(phases()).toEqual(['precheck', 'fail'])
+    expect(events.at(-1)?.done).toBe(true)
+    expect(events.at(-1)?.error?.code).toBe('INSTALL_DIR_NOT_WRITABLE')
+    // 短路口径：只问了 installDir，没往下问 lib / bin，更没有备份
+    expect(deps.checkWritable.mock.calls).toEqual([[installDir]])
+    expect(deps.cloneDir).not.toHaveBeenCalled()
+    expect(deps.removeDir).not.toHaveBeenCalled()
+    expect(deps.moveDir).not.toHaveBeenCalled()
+    expect(deps.runNpmInstall).not.toHaveBeenCalled()
+  })
+
+  test('lib/node_modules 不可写：报这一处，bin 不再问', async () => {
+    const deps = baseDeps()
+    onlyWritableExcept(deps, libDir())
+
+    const result = await runUpgrade(input(deps), emit)
+
+    expect(result.ok).toBe(false)
+    expect(result.error?.code).toBe('INSTALL_DIR_NOT_WRITABLE')
+    expect(result.error?.message.split('\n')[0]).toBe(
+      `安装目录不可写：${libDir()}（属主不是你），插件无法升级本体。`,
+    )
+    expect(deps.checkWritable.mock.calls).toEqual([[installDir], [libDir()]])
+    expect(deps.cloneDir).not.toHaveBeenCalled()
+    expect(deps.runNpmInstall).not.toHaveBeenCalled()
+  })
+
+  test('bin 不可写也要早退：npm 全局安装会往 <prefix>/bin 写链接', async () => {
+    const deps = baseDeps()
+    onlyWritableExcept(deps, binDir())
+
+    const result = await runUpgrade(input(deps), emit)
+
+    expect(result.ok).toBe(false)
+    expect(result.error?.code).toBe('INSTALL_DIR_NOT_WRITABLE')
+    expect(result.error?.message.split('\n')[0]).toBe(
+      `安装目录不可写：${binDir()}（属主不是你），插件无法升级本体。`,
+    )
+    expect(deps.checkWritable.mock.calls).toEqual([[installDir], [libDir()], [binDir()]])
+    expect(deps.cloneDir).not.toHaveBeenCalled()
+    expect(deps.runNpmInstall).not.toHaveBeenCalled()
+  })
+
+  test('检查本身抛异常也按不可写处理，不把崩溃甩给调用方', async () => {
+    const deps = baseDeps()
+    deps.checkWritable.mockRejectedValue(new Error('EIO'))
+
+    const result = await runUpgrade(input(deps), emit)
+
+    expect(result.ok).toBe(false)
+    expect(result.error?.code).toBe('INSTALL_DIR_NOT_WRITABLE')
+    expect(result.error?.message).toContain(installDir)
+    expect(deps.cloneDir).not.toHaveBeenCalled()
+  })
+
+  test('默认实现：目录不存在（ENOENT）当不可写，不抛', async () => {
+    const deps = baseDeps()
+    const partial: Partial<typeof deps> = { ...deps }
+    delete (partial as Record<string, unknown>)['checkWritable']
+
+    // installDir 在真盘上不存在：默认 checkWritable 走 access(W_OK) → ENOENT → false
+    const result = await runUpgrade(
+      { target: TARGET, installDir, root, deps: partial },
+      emit,
+    )
+
+    expect(result.ok).toBe(false)
+    expect(result.error?.code).toBe('INSTALL_DIR_NOT_WRITABLE')
+    expect(result.error?.message.split('\n')[0]).toContain(installDir)
+    expect(deps.cloneDir).not.toHaveBeenCalled()
+  })
+
+  test('默认实现：三处都真能写才继续备份', async () => {
+    const deps = baseDeps()
+    const partial: Partial<typeof deps> = { ...deps }
+    delete (partial as Record<string, unknown>)['checkWritable']
+    // 真建出三处目录：access(W_OK) 全过，状态机才往下走
+    await mkdir(installDir, { recursive: true })
+    await mkdir(libDir(), { recursive: true })
+    await mkdir(binDir(), { recursive: true })
+
+    const result = await runUpgrade(
+      { target: TARGET, installDir, root, deps: partial },
+      emit,
+    )
+
+    expect(result).toEqual({ ok: true })
+    expect(deps.cloneDir).toHaveBeenCalledTimes(1)
+    expect(deps.runNpmInstall).toHaveBeenCalledTimes(1)
   })
 })
 
@@ -130,7 +274,7 @@ describe('runUpgrade 失败回滚', () => {
     expect(result.error?.message).toContain('EACCES')
     expectRollbackTo(deps, CURRENT)
     expect(deps.runNpmInstall).toHaveBeenCalledTimes(1)
-    expect(deps.runNpmInstall).toHaveBeenCalledWith(TARGET, NPM_TIMEOUT_MS)
+    expect(deps.runNpmInstall).toHaveBeenCalledWith(TARGET, prefix, NPM_TIMEOUT_MS)
     expect(phases()).toEqual(['precheck', 'backup', 'install', 'rollback', 'fail'])
   })
 
@@ -220,7 +364,7 @@ describe('runUpgrade 成功路径', () => {
     expect(deps.removeDir).toHaveBeenCalledTimes(1)
     expect(deps.removeDir).toHaveBeenCalledWith(backupOf(CURRENT))
     expect(deps.moveDir).not.toHaveBeenCalled()
-    expect(deps.runNpmInstall).toHaveBeenCalledWith(TARGET, NPM_TIMEOUT_MS)
+    expect(deps.runNpmInstall).toHaveBeenCalledWith(TARGET, prefix, NPM_TIMEOUT_MS)
     expect(deps.runVersionProbe).toHaveBeenCalledWith(installDir)
     expect(events.at(-1)?.done).toBe(true)
     for (const event of events) {

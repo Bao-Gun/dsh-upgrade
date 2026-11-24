@@ -10,6 +10,7 @@
 | `docs/` | 说明文字 | 代码 |
 | `docs/architecture.md` | 系统怎么跑：模块表、数据流、关键约束 | 需求、待办 |
 | `docs/gotchas.md` | 踩过的坑，只追加不整理 | 通用编程常识 |
+| `docs/nas.md` | NAS 真机验收：环境快照、各场景实测与日志位置 | 计划、待办 |
 | `docs/README.md` | `docs/` 里的命名与分文件规则 | 项目说明 |
 | `docs/superpowers/plans/` | superpowers 写的实施计划，一个功能一份（进 git） | 改过的旧计划（原件不再动） |
 | `docs/superpowers/specs/` | superpowers 写的设计稿（进 git） | 已落地的结论（搬进 `docs/architecture.md`） |

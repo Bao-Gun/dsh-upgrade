@@ -1338,6 +1338,42 @@ describe('面板布局：头部固定、内容区滚动', () => {
   })
 })
 
+describe('多行错误红条', () => {
+  test('textContent 原样保留换行，样式用 pre-line 才看得出两行', async () => {
+    // 服务端给的是「事实 + 可复制命令」两行；面板只负责原样放进 DOM
+    const message =
+      '安装目录不可写：/usr/local/lib/node_modules/@deepseek-ai/dsh（属主不是你），插件无法升级本体。\n' +
+      '手动执行：sudo npm i -g --prefix /usr/local @deepseek-ai/dsh@0.2.3-alpha.2'
+    serve({
+      ...fullRoutes(),
+      'POST /dsh-upgrade/api/upgrade': () =>
+        streamResponse([
+          JSON.stringify({
+            phase: 'fail',
+            done: true,
+            error: { code: 'INSTALL_DIR_NOT_WRITABLE', message },
+          }) + '\n',
+        ]),
+    })
+
+    await openPanel(document)
+    upgradeButton()?.click()
+
+    await waitFor(() => errorBar() !== null)
+    // 不截断、不自己拼行：两行原文一个字都不少
+    expect(errorBar()?.textContent).toBe(message)
+    expect(errorBar()?.textContent?.split('\n')).toHaveLength(2)
+
+    // 换行要靠 .dshu-error 的 white-space:pre-line 才看得见，单行红条不受影响
+    const css = Array.from(document.querySelectorAll('style'))
+      .map((style) => style.textContent ?? '')
+      .join('\n')
+    expect(css).toMatch(/\.dshu-error\{[^}]*white-space:pre-line/)
+
+    closePanel()
+  })
+})
+
 describe('本体升级的 NDJSON 进度', () => {
   test('流式读到 done 后显示已升级；dsh-restart 404 时降级为需手动重启', async () => {
     const calls = serve({
