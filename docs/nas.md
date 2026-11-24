@@ -2,7 +2,7 @@
 
 Linux（飞牛 NAS）上「通过索引安装 → 拒绝路径 → 沙箱真升 / 真回滚 → 重启链」的实测记录。实施计划见 `docs/superpowers/plans/2026-11-24-linux-support.md`（Task 7），这里只记跑出来的事实。
 
-实测日期 2026-11-24，插件版本 0.2.0（commit `5d53ab6`），dsh `0.2.2-rc.5`。
+实测日期 2026-11-24，插件版本 0.2.0（commit `5d53ab6`），dsh `0.2.2-rc.5`；当晚 22:03 又用同一条路径升到 0.2.1（`ab4f8cd`），记在文末。
 
 ## 环境快照
 
@@ -69,3 +69,17 @@ cd /tmp/dshup-src && npx --yes tsx scripts/nas-selftest.ts \
 ```
 
 整轮（两次 1.2G 备份 + 两次 npm 安装）约 90s；退出码 0 才是两个场景都对。
+
+## 0.2.1 升级记录（2026-11-24 22:03）
+
+同一条索引路径再装一次（ghproxy 环境改写，commit 取索引里 `versions[0].source.commit`）：
+
+```sh
+GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0='url.https://ghproxy.net/https://github.com/.insteadOf' \
+GIT_CONFIG_VALUE_0='https://github.com/' \
+dsh plugin --profile web add 'github:Bao-Gun/dsh-upgrade#ab4f8cd461cdf735b758385407a11679a60c0e86'
+```
+
+- 27.4s 装完（`Packages: +1 -9`），profile 里落成 `github:Bao-Gun/dsh-upgrade#ab4f8cd…`，插件 `package.json` 报 `0.2.1`。
+- `lib/client.js` / `lib/index.js` 的 sha256 与本机仓库逐字节一致（`d9eb365c…` / `b2fe37e4…`），装的是同一个构建。
+- 装完不动服务：`/health` 200、`/dsh-upgrade/api/status` 200、`dsh-watchdog.service` active。这次只改了客户端 bundle，刷新页面即可，不需要重启 dsh web。
