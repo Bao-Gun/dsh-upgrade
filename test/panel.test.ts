@@ -639,6 +639,57 @@ describe('全部升级', () => {
     closePanel()
   })
 
+  test('全部升完后「全部升级」收起，标题回到「插件」，只留重启', async () => {
+    const calls = serve({
+      ...batchRoutes({ packages: ['a', 'b'] }),
+      'GET /dsh-restart/api/status': () => jsonResponse({ ok: true, health: true, port: 3080 }),
+    })
+    await openPanel(document, { pollIntervalMs: 10 })
+
+    document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')?.click()
+    await waitFor(() => document.querySelector<HTMLButtonElement>('.dshu-restart')?.hidden === false)
+
+    // 没有可更新的包了：按钮整颗收起，标题不再挂「N 个可更新」。
+    expect(document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')?.hidden).toBe(true)
+    expect(document.querySelector('.dshu-plugin-head')?.textContent).toBe('插件')
+    expect(document.querySelector('.dshu-plugin-summary')?.textContent).toContain('2 个已升级')
+    expect(callsTo(calls, 'POST', '/dsh-market/api/v1/updates')).toHaveLength(2)
+    closePanel()
+  })
+
+  test('部分失败时按钮改成「继续升级」，只重试失败的那个包', async () => {
+    const calls = serve({
+      ...batchRoutes({
+        packages: ['a', 'b'],
+        steps: {
+          a: [{ state: 'succeeded' }],
+          b: [{ state: 'failed', failure: { code: 'INSTALL_FAILED', message: '磁盘写满' } }],
+        },
+      }),
+      'GET /dsh-restart/api/status': () => jsonResponse({ ok: true, health: true, port: 3080 }),
+    })
+    await openPanel(document, { pollIntervalMs: 10 })
+
+    document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')?.click()
+    await waitFor(() => document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')?.textContent === '继续升级')
+
+    // 升成的 a 从可更新表里摘掉：标题、按钮、重试名单三处口径一致。
+    expect(document.querySelector('.dshu-plugin-head')?.textContent).toContain('插件（1 个可更新）')
+    expect(document.querySelector<HTMLButtonElement>('.dshu-restart')?.hidden).toBe(false)
+    const button = document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')
+    expect(button?.disabled).toBe(false)
+
+    button?.click()
+    await waitFor(() => callsTo(calls, 'POST', '/dsh-market/api/v1/updates').length === 3)
+    // 只补那一个失败的包，已升好的 a 不再动。
+    expect(callsTo(calls, 'POST', '/dsh-market/api/v1/updates').map((call) => call.body)).toEqual([
+      { packageName: 'a' },
+      { packageName: 'b' },
+      { packageName: 'b' },
+    ])
+    closePanel()
+  })
+
   test('升级中按钮与本体控件一起按住，结束全部恢复', async () => {
     const steps: Record<string, OperationStep[]> = { a: [{ state: 'running', percent: 10 }] }
     serve(batchRoutes({ packages: ['a', 'b'], steps }))
@@ -789,16 +840,20 @@ describe('全部升级', () => {
     closePanel()
   })
 
-  test('点全部升级的瞬间先清掉上一轮的残留文案', async () => {
-    const steps: Record<string, OperationStep[]> = { a: [{ state: 'succeeded' }] }
+  test('点「继续升级」的瞬间先清掉上一轮的残留文案', async () => {
+    const steps: Record<string, OperationStep[]> = { a: [{ state: 'failed', failure: { code: 'INSTALL_FAILED', message: '磁盘写满' } }] }
     serve(batchRoutes({ packages: ['a'], steps }))
     await openPanel(document, { pollIntervalMs: 10 })
 
     const button = document.querySelector<HTMLButtonElement>('.dshu-upgrade-all')
     button?.click()
-    await waitFor(() => document.querySelector('[data-name="a"] .dshu-plugin-state')?.textContent === '已升级')
-    await waitFor(() => button?.disabled === false)
+    await waitFor(() =>
+      (document.querySelector('[data-name="a"] .dshu-plugin-state')?.textContent ?? '').includes('磁盘写满'),
+    )
+    await waitFor(() => button?.textContent === '继续升级')
+    expect(button?.hidden).toBe(false)
 
+    steps['a']?.push({ state: 'succeeded' })
     button?.click()
     // 同步断言：第一次 await 之前就得把上一轮画的东西清掉。
     expect(document.querySelector<HTMLElement>('[data-name="a"] .dshu-plugin-state')?.textContent).toBe('')
@@ -997,10 +1052,10 @@ describe('全部升级后的重启', () => {
     liveStream().close()
 
     await waitFor(() => callsTo(calls, 'POST', '/dsh-restart/api/restart').length === 1)
-    expect(noticeText()).toContain('正在重启')
     expect(callsTo(calls, 'POST', '/dsh-restart/api/precheck')[0]?.headers['x-dsh-restart']).toBe('1')
     expect(callsTo(calls, 'POST', '/dsh-restart/api/restart')[0]?.headers['x-dsh-restart']).toBe('1')
-    expect(button.disabled).toBe(true)
+    // 重启请求一发出就把面板收掉：服务马上要重启，别留一块点不动的面板。
+    await waitFor(() => document.querySelector('[data-dshu-panel]') === null)
     closePanel()
   })
 
@@ -1139,8 +1194,8 @@ describe('全部升级后的重启', () => {
     await confirmRestart(button)
 
     await waitFor(() => noticeText().includes('预检没有返回结果'))
-    expect(textOf('.dshu-progress')).toContain('配置检查（通过）')
-    expect(textOf('.dshu-progress')).not.toContain('重启预检完成')
+    // 阶段提示只走蓝色提示框，不再往进度块里堆历史记录。
+    expect(textOf('.dshu-progress')).toBe('')
     expect(callsTo(calls, 'POST', '/dsh-restart/api/restart')).toHaveLength(0)
     closePanel()
   })
@@ -1165,7 +1220,7 @@ describe('全部升级后的重启', () => {
     await waitFor(() => noticeText().includes('预检没通过'))
     expect(noticeText()).toContain('插件兼容检查')
     expect(noticeText()).toContain('插件 X 不兼容')
-    expect(textOf('.dshu-progress')).toContain('插件兼容检查（未通过）')
+    expect(textOf('.dshu-progress')).toBe('')
     expect(callsTo(calls, 'POST', '/dsh-restart/api/restart')).toHaveLength(0)
     expect(document.querySelector<HTMLElement>('.dshu-notice')?.hidden).toBe(false)
     closePanel()
@@ -1439,27 +1494,44 @@ describe('本体升级的 NDJSON 进度', () => {
   })
 
   test('dsh-restart 在时：升级 → 预检 → 重启，全部带各自请求头', async () => {
+    const streams: { precheck: ReturnType<typeof controlledStream> | null } = { precheck: null }
     const calls = serve({
       ...fullRoutes(),
       'POST /dsh-upgrade/api/upgrade': () => textResponse('{"phase":"done","done":true}\n'),
       'GET /dsh-restart/api/status': () => jsonResponse({ ok: true, health: true, port: 3080 }),
-      'POST /dsh-restart/api/precheck': () =>
-        textResponse('{"stage":"config","ok":true,"failures":[]}\n{"stage":"compat","ok":true,"failures":[]}\n{"stage":"boot","ok":true,"failures":[]}\n{"done":true}\n'),
+      'POST /dsh-restart/api/precheck': () => {
+        const stream = controlledStream()
+        streams.precheck = stream
+        return stream.response
+      },
       'POST /dsh-restart/api/restart': () => jsonResponse({ ok: true }, 202),
     })
 
     await openPanel(document)
     upgradeButton()?.click()
 
-    await waitFor(() => noticeText().includes('正在重启'))
-    expect(noticeText()).toContain('0.2.3-alpha.2')
+    await waitFor(() => callsTo(calls, 'POST', '/dsh-restart/api/precheck').length === 1)
+    const liveStream = (): ReturnType<typeof controlledStream> => {
+      if (streams.precheck === null) throw new Error('预检请求还没发出去')
+      return streams.precheck
+    }
+    // 阶段一次只显示一项：新阶段顶掉旧阶段，蓝色提示框里不留历史记录。
+    liveStream().push('{"stage":"config","ok":true,"failures":[]}\n')
+    await waitFor(() => noticeText().includes('配置检查'))
+    liveStream().push('{"stage":"compat","ok":true,"failures":[]}\n')
+    await waitFor(() => noticeText().includes('插件兼容检查'))
+    expect(noticeText()).not.toContain('配置检查')
+    liveStream().push('{"stage":"boot","ok":true,"failures":[]}\n')
+    await waitFor(() => noticeText().includes('启动冒烟检查'))
+    liveStream().push('{"done":true}\n')
+    liveStream().close()
+
+    await waitFor(() => callsTo(calls, 'POST', '/dsh-restart/api/restart').length === 1)
     expect(errorBar()).toBeNull()
-    // 预检的三个阶段都要落进进度条，别让几十秒的冒烟检查看起来像卡死。
-    const progress = textOf('.dshu-progress')
-    expect(progress).toContain('配置检查')
-    expect(progress).toContain('插件兼容检查')
-    expect(progress).toContain('启动冒烟检查')
-    expect(progress).toContain('重启预检完成')
+    // 阶段提示只占那一行，进度块不再堆行。
+    expect(textOf('.dshu-progress')).toBe('')
+    // 重启请求发出后，面板自己关掉。
+    await waitFor(() => document.querySelector('[data-dshu-panel]') === null)
 
     const precheck = callsTo(calls, 'POST', '/dsh-restart/api/precheck')
     expect(precheck).toHaveLength(1)

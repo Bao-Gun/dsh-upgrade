@@ -32,6 +32,8 @@ const STYLE_TEXT = [
   '.dshu-entry[data-busy] svg{animation:dshu-spin 1s linear infinite}',
   '.dshu-entry .dshu-dot{display:none;position:absolute;top:4px;right:4px;width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-state-error-primary,#e5484d)}',
   '.dshu-entry[data-has-update] .dshu-dot{display:block}',
+  // 没更新时整颗收起来；这条必须写在 .dshu-entry{display:inline-flex} 之后才压得住它。
+  '.dshu-entry[hidden]{display:none}',
   '@keyframes dshu-spin{to{transform:rotate(360deg)}}',
 ].join('\n')
 
@@ -194,9 +196,19 @@ export function mountFooterEntry(doc: Document, hooks: Hooks): () => void {
   return teardown
 }
 
-/** 更新入口的视觉状态；没有按钮时安静地什么都不做。 */
-export function setEntryState(doc: Document, state: { hasUpdate: boolean; busy: boolean }): void {
-  for (const entry of Array.from(doc.querySelectorAll(`[${MARK}]`))) {
+/**
+ * 更新入口的视觉状态；没有按钮时安静地什么都不做。
+ *
+ * 没更新时整颗收起来（用户要求：平时不占位置）；但只在「查明确实没有更新」时收，
+ * known === false（查询失败）保持可见——否则一次网络抽风就会让面板永远打不开。
+ */
+export function setEntryState(
+  doc: Document,
+  state: { hasUpdate: boolean; busy: boolean; known?: boolean },
+): void {
+  const visible = state.hasUpdate || state.busy || state.known === false
+  for (const entry of Array.from(doc.querySelectorAll<HTMLElement>(`[${MARK}]`))) {
+    entry.hidden = !visible
     if (state.hasUpdate) entry.setAttribute('data-has-update', '1')
     else entry.removeAttribute('data-has-update')
     if (state.busy) entry.setAttribute('data-busy', '1')

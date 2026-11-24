@@ -1,5 +1,8 @@
 import { setEntryState, mountFooterEntry } from './inject'
-import { openPanel, probeHasUpdate } from './panel'
+import { openPanel, probeEntryState } from './panel'
+
+/** 入口平时是藏着的，所以隔一会儿静默查一次：出新版本时它自己冒出来。 */
+const ENTRY_REFRESH_MS = 5 * 60 * 1000
 
 type ClientContext = {
   effect?(fn: () => void): unknown
@@ -26,9 +29,25 @@ export function apply(ctx?: ClientContext): void {
     },
   })
 
+  const view = doc.defaultView
+  let timer: number | null = null
+
+  const refreshEntry = (): void => {
+    void probeEntryState(doc)
+      .then((state) => {
+        if (!disposed) setEntryState(doc, { ...state, busy: false })
+      })
+      .catch(() => {
+        // 查不到就当作「不知道」：入口保持可见，别把面板锁死。
+        if (!disposed) setEntryState(doc, { hasUpdate: false, busy: false, known: false })
+      })
+  }
+
   const stop = (): void => {
     if (disposed) return
     disposed = true
+    if (timer !== null && view !== null) view.clearInterval(timer)
+    timer = null
     teardownEntry()
   }
 
@@ -36,16 +55,10 @@ export function apply(ctx?: ClientContext): void {
     // 宿主是 cordis：effect 会立刻执行传入函数，并把它的返回值当 disposer。
     // 所以这里必须传「返回 stop 的函数」，不能直接传 stop——否则 apply 刚挂上入口就被拆掉。
     ctx.effect(() => stop)
-  } else {
-    const view = doc.defaultView
-    if (view !== null) view.addEventListener('pagehide', stop, { once: true })
+  } else if (view !== null) {
+    view.addEventListener('pagehide', stop, { once: true })
   }
 
-  void probeHasUpdate(doc)
-    .then((hasUpdate) => {
-      if (!disposed) setEntryState(doc, { hasUpdate, busy: false })
-    })
-    .catch(() => {
-      if (!disposed) setEntryState(doc, { hasUpdate: false, busy: false })
-    })
+  refreshEntry()
+  if (view !== null) timer = view.setInterval(refreshEntry, ENTRY_REFRESH_MS)
 }

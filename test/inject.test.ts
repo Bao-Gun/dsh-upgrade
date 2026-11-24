@@ -240,6 +240,38 @@ describe('交互与状态', () => {
 
     unmount()
   })
+
+  test('没更新时入口整颗收起，查询失败时保持可见', () => {
+    document.body.innerHTML = `
+      <div data-slot="sidebar.settings">
+        <div class="footer-row">
+          <div data-slot="settings.launcher"></div>
+          <span data-dshm-footer-group></span>
+        </div>
+      </div>
+    `
+    const unmount = mountEntry(document, { onOpen: () => {} })
+    const entry = entryNodes()[0] as HTMLElement | undefined
+    expect(entry).toBeDefined()
+
+    // 查明确实没有更新：收起，底栏不留位置。
+    setEntryState(document, { hasUpdate: false, busy: false })
+    expect(entry?.hidden).toBe(true)
+
+    // 查询失败（known:false）：不知道有没有更新，保持可见，别把面板锁死。
+    setEntryState(document, { hasUpdate: false, busy: false, known: false })
+    expect(entry?.hidden).toBe(false)
+    expect(entry?.hasAttribute('data-has-update')).toBe(false)
+
+    setEntryState(document, { hasUpdate: true, busy: false })
+    expect(entry?.hidden).toBe(false)
+
+    // 忙态也保持可见：升级中途入口不能凭空消失。
+    setEntryState(document, { hasUpdate: false, busy: true })
+    expect(entry?.hidden).toBe(false)
+
+    unmount()
+  })
 })
 
 describe('卸载', () => {

@@ -19,9 +19,9 @@
 | 工具 | `src/server/tools.ts` | 两个 agent 工具：`dsh_upgrade_check`（只读）与 `dsh_upgrade`（会动安装目录）；成功后写 last.json 的 `restartRequired` 并只回这个标记，不写 pending、不自己重启 | `index` 注册；agent 调用 |
 | 市场适配 | `src/client/market.ts` | 浏览器侧适配 dshmarket v1 的 summary / start / poll 协议，纯映射，按 code 区分市场不可用 / 操作用未知 / 未授权 / 更新失败；running 时带回 `progress`（percent/detail，只给 done/total 时自己折算）与 `wait`（排队原因）；兜底文案 `UNAVAILABLE_MESSAGE` 对外导出，批量队列复用同一句 | `panel`、`batch` |
 | 批量升级 | `src/client/batch.ts` | 串行执行全部可更新插件：按顺序 POST 起包、GET 轮询、3 分钟没有推进就判卡住、单包失败 / 回滚 / 卡住后继续下一个，宿主 409 或叫停时把剩余记成 skipped 提前收尾，汇总 succeeded / failed / skipped 与 restartRequired；只发事件，不碰 DOM | `panel` |
-| 注入 | `src/client/inject.ts` | 在底栏挂升级图标：三级退路（dshmarket 底栏 → sidebar.footer → settings.launcher）+ MutationObserver 重挂 | `src/client/index.ts` |
+| 注入 | `src/client/inject.ts` | 在底栏挂升级图标：三级退路（dshmarket 底栏 → sidebar.footer → settings.launcher）+ MutationObserver 重挂；`setEntryState` 按状态切角标 / 忙碌态，**没更新时整颗隐藏**（`known === false` 即查询失败时保持可见，别把面板锁死） | `src/client/index.ts` |
 | 面板 | `src/client/panel.ts` | 两段式面板：当前 / 可升级版本、更新内容折叠、NDJSON 进度；外壳不滚，`.dshu-head` 固定、只有 `.dshu-body` 滚动；本体阶段条按 `PHASE_LABELS` 顺序折算百分比；插件段一个「全部升级」按钮 + 两行式插件行（第一行名字 / 版本，第二行自己的进度条与**行内**文案，单包升级按钮已移除）+ 结束后的「重启 DSH」按钮（二次确认）；行内失败原因不往底部抛红条，长文压成中文首句、全文进 title；操作 3 分钟没有任何推进就解锁按钮并写明卡在哪（等会话结束 / 还在后台跑），不把按钮钉死；升级完成后调 dsh-restart 的 precheck → restart，404 时提示手动重启；status 报 `restartRequired` 时提示「需重启」而不是「已是最新」 | `src/client/index.ts` |
-| 客户端入口 | `src/client/index.ts` | 浏览器入口 `apply`：挂图标 → 拉一次 status 决定提示 → 打开面板；卸载时 teardown | 宿主客户端插件加载器 |
+| 客户端入口 | `src/client/index.ts` | 浏览器入口 `apply`：挂图标 → `probeEntryState` 拉一次决定图标显隐 → 每 5 分钟（`ENTRY_REFRESH_MS`）静默复查，出新版本时图标自己冒出来 → 打开面板；卸载时 teardown 并清掉定时器 | 宿主客户端插件加载器 |
 
 ## 数据流
 
@@ -31,7 +31,7 @@
 
 ### 插件：全部升级 → runBatch → dshmarket → 汇总 → 可选重启
 
-点「全部升级」→ `panel.startBatch` 先把每行按 `pending` 清空（上一轮文案不残留）→ `runBatch(names)` 串行：`POST /dsh-market/api/v1/updates {packageName}` 拿 operationId，随后每 `DEFAULT_POLL_INTERVAL_MS`（800ms）`GET /dsh-market/api/v1/operations?operationId=<id>`；非终态发 `running`（percent / detail / 排队原因），终态发 `settled`，一个包到终态才起下一个 → `panel` 只按 `item.name` 把事件画到对应行（`paintBatchItem`）→ 结束后写汇总「n 个已升级，m 个失败，k 个跳过（，需重启生效）」，并按 `summary.skipped` 给对应行补「已跳过」（batch 对跳过项不发事件）→ 有成功项时 `offerRestart`：`GET /dsh-restart/api/status` 200 露出「重启 DSH」，404 提示手动重启，其它状态码写明 HTTP 码 → 点按钮第一下只进「确认重启？」，第二下才走 status → precheck → restart。
+点「全部升级」→ `panel.startBatch` 先把每行按 `pending` 清空（上一轮文案不残留）→ 名单优先取 `view.retryNames`（上一轮失败 / 跳过的包），没有才取整张可更新表 → `runBatch(names)` 串行：`POST /dsh-market/api/v1/updates {packageName}` 拿 operationId，随后每 `DEFAULT_POLL_INTERVAL_MS`（800ms）`GET /dsh-market/api/v1/operations?operationId=<id>`；非终态发 `running`（percent / detail / 排队原因），终态发 `settled`，一个包到终态才起下一个 → `panel` 只按 `item.name` 把事件画到对应行（`paintBatchItem`）→ 结束后把成功的包从 `plugins.updatable` 摘掉，`paintPluginsHead` 重算标题与按钮：全升完则按钮收起、标题回「插件」；有失败 / 跳过则按钮写「继续升级」（只重试那些包，成功的不再动）→ 写汇总「n 个已升级，m 个失败，k 个跳过（，需重启生效）」，并按 `summary.skipped` 给对应行补「已跳过」（batch 对跳过项不发事件）→ 有成功项时 `offerRestart`：`GET /dsh-restart/api/status` 200 露出「重启 DSH」，404 提示手动重启，其它状态码写明 HTTP 码 → 点按钮第一下只进「确认重启？」，第二下才走 status → precheck → restart。
 
 ### 服务端 → 本机安装目录
 
@@ -57,9 +57,11 @@
 - 文案归数据层，样式归视图层（R30）：`batch.ts` 决定 `message` 与 `unavailable`，`paintBatchItem` 只做 `compactReason` 与红字判定（`failed && !unavailable`）；running 文案按 `message ?? detail ?? '正在升级…N%'`（R36），终态 `message` 已是完整句时不再补「升级失败：」（R38/R42），排队 / 卡住不上红字。
 - 行内进度的显隐必须切整个 `.dshu-plugin-progress`（R41）：只切 `.dshu-bar` 会让进度永远不可见；`percent === null` 时画不确定进度，不假装 0%。
 - `runBatch` 自身不抛：网络异常由 `pollPluginOperation` 收敛成结果对象，`onEvent` 抛错由 `emit` 内部吞掉 —— 单行绘制失败不能打断整批。
-- 批后不刷新插件列表（R47 已知边界）：names 是点击瞬间的快照，再点一次会把已升级的包重新 POST；本轮接受，先关面板重开再看。
+- 批量收尾就地更新可更新表（R52/R53）：成功的包从 `plugins.updatable` 里摘掉再 `paintPluginsHead`，所以「全升完按钮收起、标题回『插件』」不依赖重新查询；失败 / 跳过的包记进 `view.retryNames`，按钮变「继续升级」且只重试这批，已升好的不再 POST。重画列表（新一次查询）会清空 `retryNames`。
 - 关闭面板只叫停队列（`cancelled: () => view.closed` 只在每包起包前查一次）：在飞的包仍轮询到终态，结果因 `live()` 为假被丢弃；立刻重开可能撞宿主 `OPERATION_BUSY`。
 - 重启是危险动作，宁可不动：确认要两次分开的点击（首次进入 confirm 态并记 `restartArmedAt`，800ms 内的点击一律忽略，R48）；预检必须读到 `done` 才算通过，空 body / 半截流一律不重启（R49）；非 2xx 的原因依次取 `body.error ?? body.message ?? 纯文本 ?? 「HTTP n」`（R50，dsh-restart 真实契约是 `{ ok:false, error }`）；status 的「404 没装」与「连不上」分开提示。
+- 预检阶段一次只显示一项（R54）：`runRestartChain` 收到 stage 就用 `setNotice` 整段替换蓝色提示框，不往 `.dshu-progress` 追加历史行；读到 `done` 写「重启预检完成」。`POST restart` 成功后立刻 `close(view)`（R55）：服务马上重启，不留一块点不动的面板。
+- 底栏入口平时是藏着的（R56）：只有确认「有更新」或「查询失败（known=false）」才可见，`busy` 也保持可见；`src/client/index.ts` 每 5 分钟静默复查一次，否则升完一次就再也打不开面板。
 - 重启链在途时按住所有能起新工作的入口（R51）：`startBatch`、`runHostUpgrade`、`hostUpgradeDisabled` 都看 `restartRunning`，`setRestartBusy` 同时禁用「全部升级 / 重新检查 / 预发布 / 本体升级」——否则 `POST restart` 可能落在安装中途，留下半装。
 
 ## 维护

@@ -193,6 +193,8 @@ type View = {
   hostFill: HTMLElement
   pluginHead: HTMLElement
   pluginList: HTMLElement
+  /** 上一轮没升成的包；非空时「全部升级」写成「继续升级」，只重试这些。 */
+  retryNames: string[]
   /** 批量事件按名字找回自己那一行；重画列表时整张表重建。 */
   rows: Map<string, PluginRowView>
   upgradeAllButton: HTMLButtonElement
@@ -546,6 +548,7 @@ function buildView(doc: Document, options: PanelOptions): View {
     pluginHead,
     pluginList,
     rows: new Map<string, PluginRowView>(),
+    retryNames: [],
     upgradeAllButton,
     restartButton,
     restartArmed: false,
@@ -886,32 +889,46 @@ function renderReleases(view: View, reply: ReleasesReply): void {
   }
 }
 
+/**
+ * 标题与「全部升级」按钮的显示规则（一处算清，重画列表和批量收尾共用）：
+ * 没有可更新的包 → 标题写「插件」、「全部升级」整颗收起；
+ * 有可更新的包 → 标题带数量，按钮出现；上一轮有没升成的包时按钮写「继续升级」。
+ */
+function paintPluginsHead(view: View): void {
+  const plugins = view.plugins
+  if (plugins === null || !plugins.available || plugins.updatable.length === 0) {
+    view.pluginHead.textContent = '插件'
+    view.upgradeAllButton.hidden = true
+    return
+  }
+  view.pluginHead.textContent = '插件（' + plugins.updatable.length + ' 个可更新）'
+  view.upgradeAllButton.hidden = false
+  view.upgradeAllButton.textContent = view.retryNames.length > 0 ? '继续升级' : '全部升级'
+}
+
 function renderPlugins(view: View): void {
   const doc = view.doc
   view.pluginList.textContent = ''
   view.rows.clear()
+  // 重画来自一次新的查询：上一轮的重试名单作废，按新的可更新表从头来。
+  view.retryNames = []
   view.pluginSummary.hidden = true
   view.pluginSummary.textContent = ''
   const plugins = view.plugins
   if (plugins === null) {
-    view.pluginHead.textContent = '插件'
-    view.upgradeAllButton.hidden = true
+    paintPluginsHead(view)
     return
   }
   if (!plugins.available) {
-    view.pluginHead.textContent = '插件'
-    view.upgradeAllButton.hidden = true
+    paintPluginsHead(view)
     view.pluginList.appendChild(element(doc, 'div', 'dshu-plugin-unavailable', '插件更新不可用'))
     return
   }
-  view.pluginHead.textContent =
-    plugins.updatable.length > 0 ? '插件（' + plugins.updatable.length + ' 个可更新）' : '插件'
+  paintPluginsHead(view)
   if (plugins.updatable.length === 0) {
-    view.upgradeAllButton.hidden = true
     view.pluginList.appendChild(element(doc, 'div', 'dshu-plugin-empty', '已是最新'))
     return
   }
-  view.upgradeAllButton.hidden = false
   for (const update of plugins.updatable) {
     const row = createPluginRow(view, update)
     view.rows.set(update.name, row)
@@ -1095,7 +1112,8 @@ function hostUpgradeDisabled(view: View): boolean {
 function setBatchBusy(view: View, busy: boolean): void {
   view.batchBusy = busy
   view.upgradeAllButton.disabled = busy || view.upgradeBusy || view.restartRunning
-  view.upgradeAllButton.textContent = busy ? '升级中…' : '全部升级'
+  // 上一轮有没升成的包时，按钮是「继续升级」；忙态收尾也必须回到这个文案。
+  view.upgradeAllButton.textContent = busy ? '升级中…' : (view.retryNames.length > 0 ? '继续升级' : '全部升级')
   view.prerelease.disabled = busy || view.upgradeBusy || view.restartRunning
   view.refreshButton.disabled = busy || view.upgradeBusy || view.restartRunning
   if (view.upgradeButton !== null) {
@@ -1128,8 +1146,10 @@ function setRestartBusy(view: View, busy: boolean): void {
 async function startBatch(view: View): Promise<void> {
   if (view.batchBusy || view.upgradeBusy || view.restartRunning) return
   const plugins = view.plugins
-  if (plugins === null || !plugins.available || plugins.updatable.length === 0) return
-  const names = plugins.updatable.map((update) => update.name)
+  if (plugins === null || !plugins.available) return
+  // 「继续升级」只重试上一轮没升成的包；没有待重试的就按整张可更新表跑。
+  const names = view.retryNames.length > 0 ? view.retryNames.slice() : plugins.updatable.map((update) => update.name)
+  if (names.length === 0) return
   const token = view.token
   for (const [name, row] of view.rows) {
     paintBatchItem(row, { name, state: 'pending', percent: null, detail: null, message: null, unavailable: false })
@@ -1162,12 +1182,20 @@ async function startBatch(view: View): Promise<void> {
     return
   }
   if (!live(view, token)) return
+  // 升成的包从「可更新」表里摘掉：标题数字、按钮显隐都以这张表为准。
+  const done = new Set(summary.succeeded)
+  if (done.size > 0) {
+    plugins.updatable = plugins.updatable.filter((update) => !done.has(update.name))
+  }
+  // 失败和跳过的都还能重试；「继续升级」只碰这些，不再动已经升好的。
+  view.retryNames = [...summary.failed, ...summary.skipped]
   setBatchBusy(view, false)
   paintSummary(view, batchSummaryText(summary))
   for (const name of summary.skipped) {
     const row = view.rows.get(name)
     if (row !== undefined) paintSkipped(row)
   }
+  paintPluginsHead(view)
   if (summary.succeeded.length > 0) await offerRestart(view, token)
 }
 
@@ -1478,8 +1506,9 @@ async function runRestartChain(
       }
       const stage = asString(event.stage)
       if (stage !== '') {
-        // 预检会克隆 profile 再起一个冒烟实例，几十秒没反馈像是卡死；把阶段推进度条。
-        addProgress(
+        // 预检会克隆 profile 再起一个冒烟实例，几十秒没反馈像是卡死。
+        // 阶段一项一项替换同一行提示——不在下面堆一摞历史记录，只留当前这一步。
+        setNotice(
           view,
           '重启预检：' +
             (RESTART_STAGE_LABELS[stage] ?? stage) +
@@ -1487,10 +1516,10 @@ async function runRestartChain(
         )
         return
       }
-      // 失败事件也带 done；别让进度条写「完成」而下面的通知说没通过。
+      // 失败事件也带 done；别让提示写「完成」而紧接着又说没通过。
       if (event.done === true) {
         sawDone = true
-        if (!failed && event.ok !== false) addProgress(view, '重启预检完成')
+        if (!failed && event.ok !== false) setNotice(view, '重启预检完成')
       }
     })
   } catch {
@@ -1530,6 +1559,8 @@ async function runRestartChain(
     return
   }
   setNotice(view, successText)
+  // 服务马上要重启、页面随后会被重载：把面板收掉，不留一块点不动的残骸。
+  close(view)
 }
 
 async function continueToRestart(view: View, token: number, target: string): Promise<void> {
@@ -1604,8 +1635,16 @@ export async function openPanel(doc: Document, opts: PanelOptions = {}): Promise
   }
 }
 
-/** 底栏入口只需要一个布尔：本体或插件任一有更新。读不到就当没有。 */
-export async function probeHasUpdate(doc: Document, opts: PanelOptions = {}): Promise<boolean> {
+/**
+ * 底栏入口用的一次静默查询：本体或插件任一有更新就算有更新。
+ *
+ * known 区分「确实没有更新」和「没查成」：只有 known 为真时才允许把入口收起来，
+ * 查不到就保持可见，免得面板因为一次网络失败再也打不开。
+ */
+export async function probeEntryState(
+  doc: Document,
+  opts: PanelOptions = {},
+): Promise<{ hasUpdate: boolean, known: boolean }> {
   const f = fetchOf(doc)
   const base = opts.apiBase ?? ''
   try {
@@ -1621,8 +1660,14 @@ export async function probeHasUpdate(doc: Document, opts: PanelOptions = {}): Pr
     const hostUpdate = hasHostUpdate(survey)
     const pluginUpdate =
       plugins !== null && plugins.available && plugins.updatable.length > 0
-    return hostUpdate || pluginUpdate
+    const known = reply !== null && reply.ok && plugins !== null
+    return { hasUpdate: hostUpdate || pluginUpdate, known }
   } catch {
-    return false
+    return { hasUpdate: false, known: false }
   }
+}
+
+/** 只要一个布尔时的薄封装（测试与外部调用保持原样）。 */
+export async function probeHasUpdate(doc: Document, opts: PanelOptions = {}): Promise<boolean> {
+  return (await probeEntryState(doc, opts)).hasUpdate
 }
