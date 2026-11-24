@@ -12,7 +12,8 @@
 | 宿主 | `src/server/host.ts` | 找本机全局安装的 dsh（12 层祖先 + 额外目录），拉 npmmirror 的 registry 元数据，读目标版本 manifest 里的 engines | `routes`、`tools`、`index` |
 | 发布 | `src/server/releases.ts` | 拉 GitHub releases 并抽出中文更新内容（`<h3 id="cn-…">` 段），失败只降级、不阻塞升级 | `routes` |
 | 升级 | `src/server/upgrade.ts` | 升级状态机：precheck（engines / 磁盘 / 安装前缀可写）→ backup → install（`npm i -g --prefix <prefix>`，前缀从 installDir 推）→ verify → rollback；engines 与可写性校验都在备份之前，写不进去就早退成 `INSTALL_DIR_NOT_WRITABLE`（唯一产物是两行可复制命令） | `routes`、`tools` |
-| npm 前缀 | `src/server/npm.ts` | 从安装目录反推 npm 全局前缀（只认绝对路径且落在 `<prefix>/lib/node_modules/@deepseek-ai/dsh`，相对路径一律 null）、定位 npm 可执行、给子进程 PATH 补 node 目录；平台差异只在这个模块 | `upgrade` |
+| 克隆 | `src/server/clone.ts` | 备份安装目录的 cp 候选表：darwin `-c`（APFS clonefile）→ linux `--reflink=auto`（btrfs/xfs 真 CoW，ext4 自动退化为整拷，GNU cp 没有 `-c`）→ 任何平台兜底 `-R`；绝不硬链接（共享 inode，试跑会写穿线上安装目录） | `upgrade` |
+| npm 前缀 | `src/server/npm.ts` | 从安装目录反推 npm 全局前缀（只认绝对路径且落在 `<prefix>/lib/node_modules/@deepseek-ai/dsh`，相对路径一律 null）、定位 npm 可执行、给子进程 PATH 补 node 目录；平台差异只在这里与 `clone`、`notify` 三处 | `upgrade` |
 | 通知 | `src/server/notify.ts` | 升级开始前写 pending（R22），下一次启动用 osascript 发「DSH 已升级」并结算，7 天过期；对调用方永不抛 | `routes`（markPending）、`index`（settlePending） |
 | 调查 | `src/server/survey.ts` | 路由和 agent 工具共用的一份判定：当前版本、目标版本、可升级列表、是否被 engines 拦住 | `routes`、`tools` |
 | 单飞锁 | `src/server/lock.ts` | 进程内单飞：HTTP 与 agent 工具同一时刻只允许一个升级在跑 | `routes`、`tools` |
@@ -53,7 +54,7 @@
 - 安装脚本三步顺序固定：依赖 → 软链 → patch。patch 最后写，中途失败最坏只留「链在配置没认领」，重跑自愈。
 - 所有 HTTP 路由必须过请求门：方法对、带 `x-dsh-upgrade:1`、有 Origin 时与 Host 同源。这是和 dsh-restart 一起硬化的门，改一处要同步另一处。
 - 升级单飞：HTTP 与 agent 工具共用一把锁，第二个请求回 409 BUSY。
-- 备份没成功就不进入安装；回滚顺序固定 removeDir → moveDir。
+- 备份没成功就不进入安装；回滚顺序固定 removeDir → moveDir。备份的 cp 参数只从 `src/server/clone.ts` 的候选表来（平台差异只准出现在 `npm` / `clone` / `notify` 三处）；`scripts/install.mjs` 的 `cloneCandidateList` 是纯 JS 副本，由 `test/clone.test.ts` 动态 import 逐项比对钉住，改表必须同批改两边。
 - 运行期零第三方依赖：服务端只用 Node 内置与宿主注入能力，客户端只用浏览器 API 与 dshmarket v1 协议。
 - 插件批量只串行：dshmarket 没有批量端点，同一时刻只允许一个活动操作 —— 一个包到终态才起下一个；单包失败 / 回滚 / 卡住只记在自己名下，继续后面的包；只有 `cancelled()` 或宿主 `OPERATION_BUSY` 才把剩余记成 skipped 并立即收尾（R32/R40，409 不连报 N 次）。
 - 文案归数据层，样式归视图层（R30）：`batch.ts` 决定 `message` 与 `unavailable`，`paintBatchItem` 只做 `compactReason` 与红字判定（`failed && !unavailable`）；running 文案按 `message ?? detail ?? '正在升级…N%'`（R36），终态 `message` 已是完整句时不再补「升级失败：」（R38/R42），排队 / 卡住不上红字。

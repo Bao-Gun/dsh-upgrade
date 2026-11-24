@@ -3,6 +3,7 @@ import { constants, existsSync } from 'node:fs'
 import { access, mkdir, readFile, rename, rm, statfs as nodeStatfs } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { cloneCandidates } from './clone'
 import { readTargetManifest } from './host'
 import { npmBin, npmEnv, npmPrefixOf } from './npm'
 import { backupDir } from './state'
@@ -116,20 +117,26 @@ async function statfsOf(path: string): Promise<{ bavail: number; bsize: number }
   return { bavail: Number(stats.bavail), bsize: Number(stats.bsize) }
 }
 
+/** 删目录的默认实现：cloneDir 的中途清理与 removeDir dep 共用这一份，别各写一遍 rm -rf。 */
+async function removeDirDefault(path: string): Promise<void> {
+  await rm(path, { recursive: true, force: true })
+}
+
 /**
- * APFS 上 cp -c 是秒级 clonefile；不支持时退回真复制。
- * 目标目录先删掉，避免残留目录把 cp 变成「往目录里再套一层」。
+ * 备份安装目录：按 cloneCandidates 的候选表逐条试（darwin clonefile / linux reflink / 普通 -R），
+ * 任一条成功即返回；全失败抛最后一条的 stderr。
+ * 目标每次先删掉：残留目录会把 cp 变成「往目录里再套一层」，失败的那条也可能留下半个目录。
  */
 async function cloneDirDefault(src: string, dst: string): Promise<void> {
   await mkdir(dirname(dst), { recursive: true })
-  await rm(dst, { recursive: true, force: true })
-  const cloned = await run('cp', ['-c', '-R', src, dst])
-  if (cloned.code === 0) return
-  await rm(dst, { recursive: true, force: true })
-  const copied = await run('cp', ['-R', src, dst])
-  if (copied.code !== 0) {
-    throw new Error(copied.stderr.trim() === '' ? '复制安装目录失败' : copied.stderr.trim())
+  let lastStderr = ''
+  for (const args of cloneCandidates(process.platform, src, dst)) {
+    await removeDirDefault(dst)
+    const result = await run('cp', args)
+    if (result.code === 0) return
+    lastStderr = result.stderr.trim()
   }
+  throw new Error(lastStderr === '' ? '复制安装目录失败' : lastStderr)
 }
 
 /** 同盘 rename 是原子的；跨设备（EXDEV）才退回复制 + 删源。 */
@@ -202,9 +209,7 @@ const defaultDeps: UpgradeDeps = {
   statfs: statfsOf,
   checkWritable: pathWritable,
   cloneDir: cloneDirDefault,
-  removeDir: async (path) => {
-    await rm(path, { recursive: true, force: true })
-  },
+  removeDir: removeDirDefault,
   moveDir: moveDirDefault,
   runNpmInstall: npmInstall,
   readInstalledVersion: readPackageVersion,
