@@ -13,7 +13,7 @@
 | 发布 | `src/server/releases.ts` | 拉 GitHub releases 并抽出中文更新内容（`<h3 id="cn-…">` 段），失败只降级、不阻塞升级 | `routes` |
 | 升级 | `src/server/upgrade.ts` | 升级状态机：precheck（engines / 磁盘 / 安装前缀可写）→ backup（cp 走 `clone` 候选表）→ install（`npm i -g --prefix <prefix>`，前缀从 installDir 推）→ verify → rollback；engines 与可写性校验都在备份之前，写不进去就早退成 `INSTALL_DIR_NOT_WRITABLE`（唯一产物是两行可复制命令），不猜密码、不提权 | `routes`、`tools` |
 | 克隆 | `src/server/clone.ts` | 备份安装目录的 cp 候选表：darwin `-c`（APFS clonefile）→ linux `--reflink=auto`（btrfs/xfs 真 CoW，ext4 自动退化为整拷，GNU cp 没有 `-c`）→ 任何平台兜底 `-R`；绝不硬链接（共享 inode，试跑会写穿线上安装目录）；`upgrade.ts` 的 `moveDirDefault` 是回滚搬回备份的最后兜底，仍硬编码 `cp -R`（有意保留：只求把已存在的树搬回来，不再按平台挑参数） | `upgrade` |
-| npm 前缀 | `src/server/npm.ts` | 从安装目录反推 npm 全局前缀（只认绝对路径且落在 `<prefix>/lib/node_modules/@deepseek-ai/dsh`，相对路径一律 null）、定位 npm 可执行、给子进程 PATH 补 node 目录；平台判定只收在 `clone` / `notify` 两处，本模块只做纯路径推导（平台差异交给 `node:path`），调用方只负责把 `process.platform` 传进来 | `upgrade` |
+| npm 前缀 | `src/server/npm.ts` | 从安装目录反推 npm 全局前缀（只认绝对路径且落在 `<prefix>/lib/node_modules/@deepseek-ai/dsh`，相对路径一律 null）、定位 npm 可执行、给子进程 PATH 补 node 目录；平台判定只收在 `clone` / `notify` 两处，本模块只做纯路径推导（平台差异交给 `node:path`）；由 `clone` / `notify` 的调用方把 `process.platform` 传进来，`npm` 的调用方不传 | `upgrade` |
 | 通知 | `src/server/notify.ts` | 升级开始前写 pending（R22），下一次启动发「DSH 已升级」并结算，7 天过期；通知这一处的平台分支：darwin → `osascript` + AppleScript（标题与正文都做双引号转义）、linux → `notify-send`、其它 → 空 argv 静默返回 false；对调用方永不抛 | `routes`（markPending）、`index`（settlePending） |
 | 调查 | `src/server/survey.ts` | 路由和 agent 工具共用的一份判定：当前版本、目标版本、可升级列表、是否被 engines 拦住 | `routes`、`tools` |
 | 单飞锁 | `src/server/lock.ts` | 进程内单飞：HTTP 与 agent 工具同一时刻只允许一个升级在跑 | `routes`、`tools` |

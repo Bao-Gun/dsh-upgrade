@@ -414,7 +414,8 @@ export const VERIFY_DIR_PREFIX = 'dsh-upgrade-verify-'
 
 /**
  * 克隆候选表：与 src/server/clone.ts 的 cloneCandidates 逐项一致（test/clone.test.ts 钉住两边）。
- * 平台差异只准在 src/server 的 npm / clone / notify 三处（本文件是例外：clone.ts 的纯 JS 副本，由 test/clone.test.ts 钉住）；改表必须同批改两边。
+ * 平台差异只准在 src/server 的 npm / clone / notify 三处（政策口径；当前实现只有 clone / notify 真收 process.platform，npm 走 node:path）。
+ * 本文件是例外：clone.ts 的纯 JS 副本，由 test/clone.test.ts 钉住；改表必须同批改两边。
  * macOS 先 APFS clonefile（-c）；Linux 先 --reflink=auto（btrfs/xfs 真 CoW，ext4 退化为整拷；
  * GNU cp 没有 -c，不能先试）；最后一律退回普通 -R。绝不用硬链接——会共享 inode，写穿线上 profile。
  * 每条都是含源和目标的完整 argv，调用方直接 spawnSync('cp', args)。
