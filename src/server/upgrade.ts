@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
-import { mkdir, readFile, rename, rm, statfs as nodeStatfs } from 'node:fs/promises'
+import { constants, existsSync } from 'node:fs'
+import { access, mkdir, readFile, rename, rm, statfs as nodeStatfs } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { readTargetManifest } from './host'
@@ -26,6 +26,8 @@ export type UpgradeEvent = {
 
 export type UpgradeDeps = {
   statfs(p: string): Promise<{ bavail: number; bsize: number }>
+  /** 这个路径当前用户写得进去吗；ENOENT / EACCES / 任何异常一律 false，绝不抛出。 */
+  checkWritable(path: string): Promise<boolean>
   cloneDir(src: string, dst: string): Promise<void>
   removeDir(p: string): Promise<void>
   moveDir(src: string, dst: string): Promise<void>
@@ -146,6 +148,19 @@ async function moveDirDefault(src: string, dst: string): Promise<void> {
   await rm(src, { recursive: true, force: true })
 }
 
+/**
+ * 只做判断、不抛：路径不存在（ENOENT）、没权限（EACCES）以及别的意外，
+ * 都当成「写不进去」。检查本身绝不能成为新的崩溃点。
+ */
+async function pathWritable(path: string): Promise<boolean> {
+  try {
+    await access(path, constants.W_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
 async function readPackageVersion(dir: string): Promise<string | null> {
   try {
     const parsed: unknown = JSON.parse(await readFile(join(dir, 'package.json'), 'utf8'))
@@ -185,6 +200,7 @@ async function targetEngines(version: string): Promise<string | null> {
 
 const defaultDeps: UpgradeDeps = {
   statfs: statfsOf,
+  checkWritable: pathWritable,
   cloneDir: cloneDirDefault,
   removeDir: async (path) => {
     await rm(path, { recursive: true, force: true })
@@ -201,6 +217,7 @@ const defaultDeps: UpgradeDeps = {
 function mergeDeps(overrides?: Partial<UpgradeDeps>): UpgradeDeps {
   return {
     statfs: overrides?.statfs ?? defaultDeps.statfs,
+    checkWritable: overrides?.checkWritable ?? defaultDeps.checkWritable,
     cloneDir: overrides?.cloneDir ?? defaultDeps.cloneDir,
     removeDir: overrides?.removeDir ?? defaultDeps.removeDir,
     moveDir: overrides?.moveDir ?? defaultDeps.moveDir,
@@ -271,7 +288,7 @@ export async function runUpgrade(
     })
   }
 
-  // 前缀纯推导、不碰盘；Task 2 的可写性检查接在这后面
+  // 前缀纯推导、不碰盘；可写性检查接在读到当前版本之后
   const prefix = npmPrefixOf(installDir)
   if (prefix === null) {
     return fail({
@@ -288,6 +305,28 @@ export async function runUpgrade(
   }
   if (from === null) {
     return fail({ code: 'INSTALL_FAILED', message: '读不到当前安装版本，未做任何改动' })
+  }
+
+  /**
+   * npm i -g --prefix <p> 要写三处：包目录、<p>/lib/node_modules、<p>/bin（bin 链接）。
+   * 顺序固定，第一个写不进去就停——NAS 上 dsh 是 root 装的、admin 不可写，早退胜过
+   * 先备份几百 MB、再装到别处、版本校验不符、整轮回滚。
+   * 唯一产物是两行可以自己复制去跑的命令，第二行用本次 target 而不是「latest」。
+   */
+  for (const path of [installDir, join(prefix, 'lib', 'node_modules'), join(prefix, 'bin')]) {
+    let writable: boolean
+    try {
+      writable = await deps.checkWritable(path)
+    } catch {
+      writable = false
+    }
+    if (writable) continue
+    return fail({
+      code: 'INSTALL_DIR_NOT_WRITABLE',
+      message:
+        `安装目录不可写：${path}（属主不是你），插件无法升级本体。\n` +
+        `手动执行：sudo npm i -g --prefix ${prefix} @deepseek-ai/dsh@${target}`,
+    })
   }
 
   const backup = backupDir(root, from)

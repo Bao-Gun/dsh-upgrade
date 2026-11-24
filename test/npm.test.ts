@@ -19,6 +19,9 @@ describe('npmPrefixOf', () => {
   test('相对路径推不出前缀', () => {
     expect(npmPrefixOf('lib/node_modules/@deepseek-ai/dsh')).toBeNull()
     expect(npmPrefixOf('node_modules/@deepseek-ai/dsh')).toBeNull()
+    // ../ 或 ./ 开头能切出 '..' / '.'，但那不是可用的 <prefix>：只有绝对路径才算
+    expect(npmPrefixOf('../lib/node_modules/@deepseek-ai/dsh')).toBeNull()
+    expect(npmPrefixOf('./lib/node_modules/@deepseek-ai/dsh')).toBeNull()
   })
 
   test('少了 /lib/node_modules 或包名对不上都推不出', () => {

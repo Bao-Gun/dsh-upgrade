@@ -11,8 +11,8 @@
 | 状态 | `src/server/state.ts` | 读写 `~/.dsh/dsh-upgrade/` 下的 cache / pending / last，给出备份目录路径；维护 last 里的「已升级待重启」标记（`readRestartRequired` / `clearRestartRequired`） | `host`、`notify`、`routes`、`tools`、`upgrade`、`index` |
 | 宿主 | `src/server/host.ts` | 找本机全局安装的 dsh（12 层祖先 + 额外目录），拉 npmmirror 的 registry 元数据，读目标版本 manifest 里的 engines | `routes`、`tools`、`index` |
 | 发布 | `src/server/releases.ts` | 拉 GitHub releases 并抽出中文更新内容（`<h3 id="cn-…">` 段），失败只降级、不阻塞升级 | `routes` |
-| 升级 | `src/server/upgrade.ts` | 升级状态机：precheck（engines / 磁盘）→ backup → install（`npm i -g --prefix <prefix>`，前缀从 installDir 推）→ verify → rollback；engines 校验在备份之前 | `routes`、`tools` |
-| npm 前缀 | `src/server/npm.ts` | 从安装目录反推 npm 全局前缀（只认 `<prefix>/lib/node_modules/@deepseek-ai/dsh`）、定位 npm 可执行、给子进程 PATH 补 node 目录；平台差异只在这个模块 | `upgrade` |
+| 升级 | `src/server/upgrade.ts` | 升级状态机：precheck（engines / 磁盘 / 安装前缀可写）→ backup → install（`npm i -g --prefix <prefix>`，前缀从 installDir 推）→ verify → rollback；engines 与可写性校验都在备份之前，写不进去就早退成 `INSTALL_DIR_NOT_WRITABLE`（唯一产物是两行可复制命令） | `routes`、`tools` |
+| npm 前缀 | `src/server/npm.ts` | 从安装目录反推 npm 全局前缀（只认绝对路径且落在 `<prefix>/lib/node_modules/@deepseek-ai/dsh`，相对路径一律 null）、定位 npm 可执行、给子进程 PATH 补 node 目录；平台差异只在这个模块 | `upgrade` |
 | 通知 | `src/server/notify.ts` | 升级开始前写 pending（R22），下一次启动用 osascript 发「DSH 已升级」并结算，7 天过期；对调用方永不抛 | `routes`（markPending）、`index`（settlePending） |
 | 调查 | `src/server/survey.ts` | 路由和 agent 工具共用的一份判定：当前版本、目标版本、可升级列表、是否被 engines 拦住 | `routes`、`tools` |
 | 单飞锁 | `src/server/lock.ts` | 进程内单飞：HTTP 与 agent 工具同一时刻只允许一个升级在跑 | `routes`、`tools` |
@@ -49,6 +49,7 @@
 ## 关键约束
 
 - engines 校验必须在备份之前（`src/server/upgrade.ts`）：顺序反了会先复制一份用不上的备份，再报 Node 不满足。
+- 安装前缀可写性也要在备份之前（`src/server/upgrade.ts`）：npm 全局安装会写三处 —— installDir、`<prefix>/lib/node_modules`、`<prefix>/bin`（bin 链接），按这个顺序第一个写不进去就报 `INSTALL_DIR_NOT_WRITABLE`。漏查 bin 会在 NAS 上照样晚失败 + 整轮回滚（`npm i -g --prefix` 装包成功、写链接时才 EACCES）。消息固定两行：哪一处不可写 + `sudo npm i -g --prefix <prefix> @deepseek-ai/dsh@<target>`，版本号用本次 target（不是「latest」），面板靠 `.dshu-error` 的 `white-space:pre-line` 保住换行、自己不拼串也不截断。
 - 安装脚本三步顺序固定：依赖 → 软链 → patch。patch 最后写，中途失败最坏只留「链在配置没认领」，重跑自愈。
 - 所有 HTTP 路由必须过请求门：方法对、带 `x-dsh-upgrade:1`、有 Origin 时与 Host 同源。这是和 dsh-restart 一起硬化的门，改一处要同步另一处。
 - 升级单飞：HTTP 与 agent 工具共用一把锁，第二个请求回 409 BUSY。

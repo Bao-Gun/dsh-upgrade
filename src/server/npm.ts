@@ -1,4 +1,4 @@
-import { delimiter as pathDelimiter, join, sep } from 'node:path'
+import { delimiter as pathDelimiter, isAbsolute, join, sep } from 'node:path'
 
 /** npm 全局包固定落在 <prefix>/lib/node_modules 下，这是唯一认得的安装形状。 */
 const INSTALL_SUFFIX = join('lib', 'node_modules', '@deepseek-ai', 'dsh')
@@ -9,10 +9,12 @@ const INSTALL_SUFFIX = join('lib', 'node_modules', '@deepseek-ai', 'dsh')
  * 别处、版本校验再逮住回滚，所以只认形状，推不出来就交给调用方失败。
  */
 export function npmPrefixOf(installDir: string): string | null {
+  // 只有绝对路径才谈得上「回到某个 <prefix>」：../lib/... 会切出 '..'，拿它当 --prefix 等于赌 cwd
+  if (!isAbsolute(installDir)) return null
   const suffix = sep + INSTALL_SUFFIX
   if (!installDir.endsWith(suffix)) return null
   const prefix = installDir.slice(0, -suffix.length)
-  // 前缀为空说明整条路径就是后缀本身（相对路径），没有可回的 <prefix>
+  // 前缀为空说明整条路径就是后缀本身（装在根 / 下），没有可回的 <prefix>
   return prefix === '' ? null : prefix
 }
 
