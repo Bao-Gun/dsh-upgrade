@@ -518,6 +518,24 @@ describe('插件段', () => {
     closePanel()
   })
 
+  test('版本是 40 位 commit 时只显示短哈希，全文留在 title 里', async () => {
+    const from = '08f9424697e531a03918e3c60298366f2fb93b50'
+    const to = 'ab4f8cd461cdf735b758385407a11679a60c0e86'
+    serve({
+      ...fullRoutes(),
+      'GET /dsh-market/api/v1/updates/summary': () => jsonResponse({
+        schema: 1,
+        checked: 3,
+        packages: [{ name: 'dsh-upgrade', source: 'github', installedVersion: from, latestVersion: to }],
+      }),
+    })
+    await openPanel(document)
+    const version = document.querySelector<HTMLElement>('.dshu-plugin[data-name="dsh-upgrade"] .dshu-plugin-version')
+    expect(version?.textContent).toBe('08f9424 → ab4f8cd')
+    expect(version?.title).toBe(from + ' → ' + to)
+    closePanel()
+  })
+
   test('插件行不再自带升级按钮', async () => {
     serve(fullRoutes())
     await openPanel(document)

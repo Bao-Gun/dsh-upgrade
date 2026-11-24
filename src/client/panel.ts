@@ -950,6 +950,17 @@ export type PluginRowView = {
 }
 
 /**
+ * 索引装的插件是 `github:…#<commit>` 钉死的，市场对这种显式 ref 放弃语义化
+ * 版本比较，于是把两端的 commit 当版本名给过来（40 位十六进制）。整串会把这个
+ * 窄列撑爆、也读不出先后，所以只显示前 7 位；全文进 title，短哈希也不是猜的。
+ */
+const FULL_COMMIT = /^[0-9a-f]{40}$/i
+
+export function compactVersion(value: string): string {
+  return FULL_COMMIT.test(value) ? value.slice(0, 7) : value
+}
+
+/**
  * 两行式：第一行名字与版本对，第二行是这一行自己的状态与进度。
  * 不在行内放升级入口——升级由面板顶部的一个「全部升级」串行驱动。
  */
@@ -959,7 +970,11 @@ function createPluginRow(view: View, update: PluginUpdate): PluginRowView {
   root.dataset.name = update.name
   const line = element(doc, 'div', 'dshu-plugin-line')
   const name = element(doc, 'div', 'dshu-plugin-name', update.name)
-  const version = element(doc, 'div', 'dshu-plugin-version', update.from + ' → ' + update.to)
+  const full = update.from + ' → ' + update.to
+  const shown = compactVersion(update.from) + ' → ' + compactVersion(update.to)
+  const version = element(doc, 'div', 'dshu-plugin-version', shown)
+  // 只有被缩短过才挂 title：没缩短时 title 与正文一样，等于噪音。
+  if (shown !== full) version.title = full
   line.append(name, version)
   const state = element(doc, 'div', 'dshu-plugin-state')
   const progress = element(doc, 'div', 'dshu-plugin-progress')
