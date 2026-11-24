@@ -11,7 +11,8 @@
 | 状态 | `src/server/state.ts` | 读写 `~/.dsh/dsh-upgrade/` 下的 cache / pending / last，给出备份目录路径；维护 last 里的「已升级待重启」标记（`readRestartRequired` / `clearRestartRequired`） | `host`、`notify`、`routes`、`tools`、`upgrade`、`index` |
 | 宿主 | `src/server/host.ts` | 找本机全局安装的 dsh（12 层祖先 + 额外目录），拉 npmmirror 的 registry 元数据，读目标版本 manifest 里的 engines | `routes`、`tools`、`index` |
 | 发布 | `src/server/releases.ts` | 拉 GitHub releases 并抽出中文更新内容（`<h3 id="cn-…">` 段），失败只降级、不阻塞升级 | `routes` |
-| 升级 | `src/server/upgrade.ts` | 升级状态机：precheck（engines / 磁盘）→ backup → install（npm i -g）→ verify → rollback；engines 校验在备份之前 | `routes`、`tools` |
+| 升级 | `src/server/upgrade.ts` | 升级状态机：precheck（engines / 磁盘）→ backup → install（`npm i -g --prefix <prefix>`，前缀从 installDir 推）→ verify → rollback；engines 校验在备份之前 | `routes`、`tools` |
+| npm 前缀 | `src/server/npm.ts` | 从安装目录反推 npm 全局前缀（只认 `<prefix>/lib/node_modules/@deepseek-ai/dsh`）、定位 npm 可执行、给子进程 PATH 补 node 目录；平台差异只在这个模块 | `upgrade` |
 | 通知 | `src/server/notify.ts` | 升级开始前写 pending（R22），下一次启动用 osascript 发「DSH 已升级」并结算，7 天过期；对调用方永不抛 | `routes`（markPending）、`index`（settlePending） |
 | 调查 | `src/server/survey.ts` | 路由和 agent 工具共用的一份判定：当前版本、目标版本、可升级列表、是否被 engines 拦住 | `routes`、`tools` |
 | 单飞锁 | `src/server/lock.ts` | 进程内单飞：HTTP 与 agent 工具同一时刻只允许一个升级在跑 | `routes`、`tools` |

@@ -1,8 +1,10 @@
 import { spawn } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { mkdir, readFile, rename, rm, statfs as nodeStatfs } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { readTargetManifest } from './host'
+import { npmBin, npmEnv, npmPrefixOf } from './npm'
 import { backupDir } from './state'
 import { describeEnginesFailure, satisfiesNodeRange } from './versions'
 
@@ -29,6 +31,7 @@ export type UpgradeDeps = {
   moveDir(src: string, dst: string): Promise<void>
   runNpmInstall(
     target: string,
+    prefix: string,
     timeoutMs: number,
   ): Promise<{ code: number; stdout: string; stderr: string }>
   readInstalledVersion(dir: string): Promise<string | null>
@@ -54,7 +57,7 @@ function errorMessage(error: unknown): string {
 function run(
   command: string,
   args: string[],
-  options: { cwd?: string; timeoutMs?: number } = {},
+  options: { cwd?: string; timeoutMs?: number; env?: NodeJS.ProcessEnv } = {},
 ): Promise<RunResult> {
   return new Promise((resolve) => {
     let stdout = ''
@@ -62,7 +65,10 @@ function run(
     let settled = false
     let timer: NodeJS.Timeout | undefined
 
-    const child = spawn(command, args, options.cwd === undefined ? {} : { cwd: options.cwd })
+    const spawnOptions: { cwd?: string; env?: NodeJS.ProcessEnv } = {}
+    if (options.cwd !== undefined) spawnOptions.cwd = options.cwd
+    if (options.env !== undefined) spawnOptions.env = options.env
+    const child = spawn(command, args, spawnOptions)
 
     const finish = (code: number): void => {
       if (settled) return
@@ -160,9 +166,16 @@ async function runProbe(dir: string): Promise<string | null> {
   return first === '' ? null : first
 }
 
-function npmInstall(target: string, timeoutMs: number): Promise<RunResult> {
+function npmInstall(target: string, prefix: string, timeoutMs: number): Promise<RunResult> {
+  const nodeDir = dirname(process.execPath)
+  // --prefix 必须显式给：让 npm 自己决定会在 NAS 上装到 ~/.local（原因见 npmPrefixOf）。
+  // npm 用绝对路径、PATH 补 node 目录，因为 systemd 用户服务拉起的进程未必带着它们。
   // cwd 用临时目录：不在安装目录里跑 npm，免得 cwd 被删/搬走
-  return run('npm', ['i', '-g', `@deepseek-ai/dsh@${target}`], { cwd: tmpdir(), timeoutMs })
+  return run(npmBin(nodeDir, existsSync), ['i', '-g', '--prefix', prefix, `@deepseek-ai/dsh@${target}`], {
+    cwd: tmpdir(),
+    timeoutMs,
+    env: npmEnv(process.env, nodeDir),
+  })
 }
 
 async function targetEngines(version: string): Promise<string | null> {
@@ -258,6 +271,15 @@ export async function runUpgrade(
     })
   }
 
+  // 前缀纯推导、不碰盘；Task 2 的可写性检查接在这后面
+  const prefix = npmPrefixOf(installDir)
+  if (prefix === null) {
+    return fail({
+      code: 'INSTALL_FAILED',
+      message: `无法从安装目录推导 npm 全局前缀：${installDir}（期望 <prefix>/lib/node_modules/@deepseek-ai/dsh）`,
+    })
+  }
+
   let from: string | null
   try {
     from = await deps.readInstalledVersion(installDir)
@@ -311,7 +333,7 @@ export async function runUpgrade(
 
   let install: RunResult
   try {
-    install = await deps.runNpmInstall(target, NPM_TIMEOUT_MS)
+    install = await deps.runNpmInstall(target, prefix, NPM_TIMEOUT_MS)
   } catch (error) {
     return await rollback({ code: 'INSTALL_FAILED', message: `安装失败：${errorMessage(error)}` })
   }

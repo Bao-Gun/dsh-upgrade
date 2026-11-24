@@ -22,18 +22,21 @@ type Fixture = {
   nodeVersion: Mock
 }
 
+let prefix: string
 let installDir: string
 let root: string
 let events: UpgradeEvent[]
 
 beforeEach(async () => {
-  installDir = await mkdtemp(join(tmpdir(), 'dsh-upgrade-install-'))
+  // 安装目录必须落在 <prefix>/lib/node_modules/@deepseek-ai/dsh 上，前缀才能推出来
+  prefix = await mkdtemp(join(tmpdir(), 'dsh-upgrade-prefix-'))
+  installDir = join(prefix, 'lib', 'node_modules', '@deepseek-ai', 'dsh')
   root = await mkdtemp(join(tmpdir(), 'dsh-upgrade-root-'))
   events = []
 })
 
 afterEach(async () => {
-  await rm(installDir, { recursive: true, force: true })
+  await rm(prefix, { recursive: true, force: true })
   await rm(root, { recursive: true, force: true })
 })
 
@@ -101,6 +104,27 @@ describe('runUpgrade 前置校验', () => {
     expect(events.at(-1)?.error?.code).toBe('RUNTIME_UNSUPPORTED')
   })
 
+  test('安装目录推不出前缀：INSTALL_FAILED，不读版本、不备份、不安装', async () => {
+    const deps = baseDeps()
+    // 少了 /lib：不猜前缀，直接失败——让 npm 自己决定前缀在 NAS 上会装到 ~/.local
+    const oddDir = join(prefix, 'node_modules', '@deepseek-ai', 'dsh')
+
+    const result = await runUpgrade({ target: TARGET, installDir: oddDir, root, deps }, emit)
+
+    expect(result.ok).toBe(false)
+    expect(result.error?.code).toBe('INSTALL_FAILED')
+    expect(result.error?.message).toBe(
+      `无法从安装目录推导 npm 全局前缀：${oddDir}（期望 <prefix>/lib/node_modules/@deepseek-ai/dsh）`,
+    )
+    expect(result.rolledBack).toBeUndefined()
+    expect(phases()).toEqual(['precheck', 'fail'])
+    expect(deps.readInstalledVersion).not.toHaveBeenCalled()
+    expect(deps.cloneDir).not.toHaveBeenCalled()
+    expect(deps.removeDir).not.toHaveBeenCalled()
+    expect(deps.moveDir).not.toHaveBeenCalled()
+    expect(deps.runNpmInstall).not.toHaveBeenCalled()
+  })
+
   test('可用空间只有 1 GB 时 NO_SPACE：不备份、不安装', async () => {
     const deps = baseDeps()
     deps.statfs.mockResolvedValue({ bavail: 1024, bsize: MIB })
@@ -130,7 +154,7 @@ describe('runUpgrade 失败回滚', () => {
     expect(result.error?.message).toContain('EACCES')
     expectRollbackTo(deps, CURRENT)
     expect(deps.runNpmInstall).toHaveBeenCalledTimes(1)
-    expect(deps.runNpmInstall).toHaveBeenCalledWith(TARGET, NPM_TIMEOUT_MS)
+    expect(deps.runNpmInstall).toHaveBeenCalledWith(TARGET, prefix, NPM_TIMEOUT_MS)
     expect(phases()).toEqual(['precheck', 'backup', 'install', 'rollback', 'fail'])
   })
 
@@ -220,7 +244,7 @@ describe('runUpgrade 成功路径', () => {
     expect(deps.removeDir).toHaveBeenCalledTimes(1)
     expect(deps.removeDir).toHaveBeenCalledWith(backupOf(CURRENT))
     expect(deps.moveDir).not.toHaveBeenCalled()
-    expect(deps.runNpmInstall).toHaveBeenCalledWith(TARGET, NPM_TIMEOUT_MS)
+    expect(deps.runNpmInstall).toHaveBeenCalledWith(TARGET, prefix, NPM_TIMEOUT_MS)
     expect(deps.runVersionProbe).toHaveBeenCalledWith(installDir)
     expect(events.at(-1)?.done).toBe(true)
     for (const event of events) {
