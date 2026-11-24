@@ -62,6 +62,7 @@
 - 重启是危险动作，宁可不动：确认要两次分开的点击（首次进入 confirm 态并记 `restartArmedAt`，800ms 内的点击一律忽略，R48）；预检必须读到 `done` 才算通过，空 body / 半截流一律不重启（R49）；非 2xx 的原因依次取 `body.error ?? body.message ?? 纯文本 ?? 「HTTP n」`（R50，dsh-restart 真实契约是 `{ ok:false, error }`）；status 的「404 没装」与「连不上」分开提示。
 - 预检阶段一次只显示一项（R54）：`runRestartChain` 收到 stage 就用 `setNotice` 整段替换蓝色提示框，不往 `.dshu-progress` 追加历史行；读到 `done` 写「重启预检完成」。`POST restart` 成功后立刻 `close(view)`（R55）：服务马上重启，不留一块点不动的面板。
 - 底栏入口平时是藏着的（R56）：只有确认「有更新」或「查询失败（known=false）」才可见，`busy` 也保持可见；`src/client/index.ts` 每 5 分钟静默复查一次，否则升完一次就再也打不开面板。
+- 状态必须跟着座位走（R57）：`setEntryState` 把状态记进 `inject.ts` 的 `entryStates`（WeakMap<Document, EntryState>），`mountFooterEntry` 每次把按钮插进座位时立刻 `paintEntry` 重画一次 —— 第一次静默查询常在底栏画出来之前就返回（实测：查询 t≈100ms 完成、按钮 t≈420ms 才落座），不补这一下入口会以默认可见的样子留在底栏，直到五分钟后的下一次复查；外壳重渲染后补挂同理。`teardown` 要 `entryStates.delete(doc)`，否则重挂会带上一轮的旧状态。
 - 重启链在途时按住所有能起新工作的入口（R51）：`startBatch`、`runHostUpgrade`、`hostUpgradeDisabled` 都看 `restartRunning`，`setRestartBusy` 同时禁用「全部升级 / 重新检查 / 预发布 / 本体升级」——否则 `POST restart` 可能落在安装中途，留下半装。
 
 ## 维护

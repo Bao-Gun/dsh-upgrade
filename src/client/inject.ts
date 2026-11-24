@@ -39,6 +39,12 @@ const STYLE_TEXT = [
 
 type Hooks = { onOpen(): void }
 
+/** 入口的对外状态；known === false 表示「没查成」，此时保持可见。 */
+type EntryState = { hasUpdate: boolean; busy: boolean; known?: boolean }
+
+/** 每个文档最近一次状态：座位晚到（外壳还没画完底栏）时，挂上后要把它补回来。 */
+const entryStates = new WeakMap<Document, EntryState>()
+
 /** 一个可插入的位置：parent 里、before 之前（before 为 null 表示末尾）。 */
 type Seat = { parent: Element; before: ChildNode | null }
 
@@ -160,6 +166,10 @@ export function mountFooterEntry(doc: Document, hooks: Hooks): () => void {
     if (placed) return
 
     seat.parent.insertBefore(button, seat.before)
+    // 座位可能比状态晚到（外壳先返回、底栏后渲染）：挂上的这一瞬间把记着的状态补上，
+    // 否则那一颗会以「默认可见」的样子留在底栏，直到下一次静默查询。
+    const remembered = entryStates.get(doc)
+    if (remembered !== undefined) paintEntry(button, remembered)
   }
 
   const Observer = typeof MutationObserver === 'function' ? MutationObserver : undefined
@@ -188,6 +198,7 @@ export function mountFooterEntry(doc: Document, hooks: Hooks): () => void {
       frame = null
     }
     button.remove()
+    entryStates.delete(doc)
     const style = doc.getElementById(STYLE_ID)
     if (style !== null) style.remove()
     if (mountedEntries.get(doc) === teardown) mountedEntries.delete(doc)
@@ -202,16 +213,19 @@ export function mountFooterEntry(doc: Document, hooks: Hooks): () => void {
  * 没更新时整颗收起来（用户要求：平时不占位置）；但只在「查明确实没有更新」时收，
  * known === false（查询失败）保持可见——否则一次网络抽风就会让面板永远打不开。
  */
-export function setEntryState(
-  doc: Document,
-  state: { hasUpdate: boolean; busy: boolean; known?: boolean },
-): void {
-  const visible = state.hasUpdate || state.busy || state.known === false
+export function setEntryState(doc: Document, state: EntryState): void {
+  entryStates.set(doc, state)
   for (const entry of Array.from(doc.querySelectorAll<HTMLElement>(`[${MARK}]`))) {
-    entry.hidden = !visible
-    if (state.hasUpdate) entry.setAttribute('data-has-update', '1')
-    else entry.removeAttribute('data-has-update')
-    if (state.busy) entry.setAttribute('data-busy', '1')
-    else entry.removeAttribute('data-busy')
+    paintEntry(entry, state)
   }
+}
+
+/** 把一份状态画到一颗按钮上：可见性 + 两个属性，别处不再重复这套判断。 */
+function paintEntry(entry: HTMLElement, state: EntryState): void {
+  const visible = state.hasUpdate || state.busy || state.known === false
+  entry.hidden = !visible
+  if (state.hasUpdate) entry.setAttribute('data-has-update', '1')
+  else entry.removeAttribute('data-has-update')
+  if (state.busy) entry.setAttribute('data-busy', '1')
+  else entry.removeAttribute('data-busy')
 }

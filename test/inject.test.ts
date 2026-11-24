@@ -168,6 +168,76 @@ describe('外壳重渲染后的补挂', () => {
     unmount()
   })
 
+  test('座位比状态晚到时，按钮一挂上就带着记着的状态（没更新就收起）', async () => {
+    // 外壳先返回了骨架，底栏还没画出来：此刻没有座位。
+    document.body.innerHTML = '<div id="footer"></div>'
+    const unmount = mountEntry(document, { onOpen: () => {} })
+    await settle(document)
+    expect(entryNodes()).toHaveLength(0)
+
+    // 静默查询先回来了：查明确实没有更新。
+    setEntryState(document, { hasUpdate: false, busy: false })
+
+    // 外壳这时才把底栏画出来。
+    document.body.innerHTML = `
+      <div id="footer">
+        <div data-slot="sidebar.settings">
+          <div class="footer-row">
+            <div data-slot="settings.launcher"></div>
+            <span data-dshm-footer-group></span>
+          </div>
+        </div>
+      </div>
+    `
+    await settle(document)
+
+    const entries = entryNodes()
+    expect(entries).toHaveLength(1)
+    // 晚到的那一颗不能以默认可见的样子留在底栏。
+    expect((entries[0] as HTMLElement).hidden).toBe(true)
+
+    unmount()
+  })
+
+  test('外壳重建那一行后，补回来的按钮仍然带着上次的状态', async () => {
+    document.body.innerHTML = `
+      <div id="footer">
+        <div data-slot="sidebar.settings">
+          <div class="footer-row">
+            <div data-slot="settings.launcher"></div>
+            <span data-dshm-footer-group></span>
+          </div>
+        </div>
+      </div>
+    `
+    const unmount = mountEntry(document, { onOpen: () => {} })
+    await settle(document)
+    setEntryState(document, { hasUpdate: true, busy: false })
+    const before = entryNodes()[0] as HTMLElement | undefined
+    expect(before?.hidden).toBe(false)
+    expect(before?.getAttribute('data-has-update')).toBe('1')
+
+    // 外壳把这一行整棵丢掉又重建：入口被摘下来，再补回去。
+    document.body.innerHTML = `
+      <div id="footer">
+        <div data-slot="sidebar.settings">
+          <div class="footer-row">
+            <div data-slot="settings.launcher"></div>
+            <span data-dshm-footer-group></span>
+          </div>
+        </div>
+      </div>
+    `
+    await settle(document)
+
+    const after = entryNodes()[0] as HTMLElement | undefined
+    expect(after).toBeDefined()
+    expect(after?.getAttribute('data-has-update')).toBe('1')
+    expect(after?.hidden).toBe(false)
+
+    unmount()
+  })
+
   test('挂上之后观察器不再自我触发', async () => {
     document.body.innerHTML = `
       <div data-slot="sidebar.settings">
