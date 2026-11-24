@@ -414,6 +414,7 @@ export const VERIFY_DIR_PREFIX = 'dsh-upgrade-verify-'
 
 /**
  * 克隆候选表：与 src/server/clone.ts 的 cloneCandidates 逐项一致（test/clone.test.ts 钉住两边）。
+ * 平台差异只准在 src/server 的 npm / clone / notify 三处（本文件是例外：clone.ts 的纯 JS 副本，由 test/clone.test.ts 钉住）；改表必须同批改两边。
  * macOS 先 APFS clonefile（-c）；Linux 先 --reflink=auto（btrfs/xfs 真 CoW，ext4 退化为整拷；
  * GNU cp 没有 -c，不能先试）；最后一律退回普通 -R。绝不用硬链接——会共享 inode，写穿线上 profile。
  * 每条都是含源和目标的完整 argv，调用方直接 spawnSync('cp', args)。
@@ -439,12 +440,13 @@ export function cloneArgs(source, dest, platform = process.platform) {
   return cloneCandidateList(source, dest, platform)[0]
 }
 
-/** 把一组候选参数翻成日志里看得懂的话（最后两段固定是 source / dest）。 */
-function cloneLabel(args) {
+/** 把一组候选参数翻成日志里看得懂的话（最后两段固定是 source / dest）；note 接一句回退说明。 */
+function cloneLabel(args, note = '') {
   const flags = args.slice(0, -2).join(' ')
-  if (args.includes('-c')) return `cp ${flags}（APFS clonefile）`
-  if (args.includes('--reflink=auto')) return `cp ${flags}（reflink=auto：btrfs/xfs 真 CoW，ext4 退化为整拷）`
-  return `cp ${flags}（普通拷贝）`
+  let how = '普通拷贝'
+  if (args.includes('-c')) how = 'APFS clonefile'
+  else if (args.includes('--reflink=auto')) how = 'reflink=auto：btrfs/xfs 真 CoW，ext4 退化为整拷'
+  return `cp ${flags}（${how}${note === '' ? '' : `，${note}`}）`
 }
 
 /** 独立实例的启动参数：端口 0 由宿主分配，绝不碰已有的 3080。 */
@@ -608,7 +610,7 @@ export async function runVerify({
     // macOS 上 clonefile 可能不被文件系统支持：失败后清掉半个目录，换候选表的兜底真拷贝再试一次
     if (copied.status !== 0 && process.platform === 'darwin') {
       await rm(profileCopy, { recursive: true, force: true }).catch(() => {})
-      label = `${cloneLabel(candidates[1])}（clonefile 失败，已回退）`
+      label = cloneLabel(candidates[1], 'clonefile 失败已回退')
       copied = spawnSync('cp', candidates[1], { encoding: 'utf8' })
     }
     if (copied.status !== 0) {

@@ -11,6 +11,14 @@ npm run build && node scripts/install.mjs --apply
 
 装完重启 dsh web。只跑 `node scripts/install.mjs` 是 dry-run，只打印将要改什么。
 
+## 平台支持
+
+| 平台 | 支持情况 |
+|---|---|
+| macOS arm64 | 全功能：本体 / 插件升级、桌面通知、重启链；备份优先走 APFS clonefile。 |
+| Linux（飞牛 NAS、systemd 用户级服务） | 插件升级、桌面通知（取决于会话有没有 DBus/通知后端，没有则静默跳过，见 `docs/gotchas.md`）、重启链可用；本体升级若 dsh 装在 root 所有的目录（如 `/usr/local`），会在备份前报 `INSTALL_DIR_NOT_WRITABLE` 并给出两行提示：哪一处不可写 + 一行可复制的 `sudo` 命令，需要手动执行。 |
+| 其它平台 | 未验证：备份只走普通 `cp -R`，桌面通知静默跳过。 |
+
 ## 用法
 
 底栏的升级图标打开面板。本体段升级 dsh 本身；插件段只有一条路：

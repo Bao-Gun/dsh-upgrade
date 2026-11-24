@@ -14,7 +14,7 @@ export function npmPrefixOf(installDir: string): string | null {
   const suffix = sep + INSTALL_SUFFIX
   if (!installDir.endsWith(suffix)) return null
   const prefix = installDir.slice(0, -suffix.length)
-  // 前缀为空说明整条路径就是后缀本身（装在根 / 下），没有可回的 <prefix>
+  // 前缀为空（prefix 即 /）推不出可用的 --prefix 值，所以不认
   return prefix === '' ? null : prefix
 }
 
