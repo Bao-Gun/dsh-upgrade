@@ -3,10 +3,10 @@ import { clearPending, readPending, writePending, type Pending } from './state'
 
 /**
  * R19：这个模块是唯一决定「升级成功了，该告诉用户」的地方，对调用方永不抛。
- * osascript 失败、marker 坏掉、文件不存在，一律降级成静默。
+ * 通知程序失败、marker 坏掉、文件不存在，一律降级成静默。
  */
 export type NotifyDeps = {
-  runOsascript(script: string): Promise<boolean>
+  runNotify(argv: string[]): Promise<boolean>
 }
 
 type Outcome = 'notify' | 'wait' | 'clear' | 'none'
@@ -20,13 +20,32 @@ function escapeForAppleScript(text: string): string {
   return text.replace(/"/g, '\\"')
 }
 
-function notificationScript(to: string): string {
-  const body = `已升级到 ${escapeForAppleScript(to)}，进程已重启`
-  return `display notification "${body}" with title "${NOTIFICATION_TITLE}"`
+function notificationScript(title: string, body: string): string {
+  return `display notification "${escapeForAppleScript(body)}" with title "${escapeForAppleScript(title)}"`
 }
 
-/** 默认实现：spawn osascript，退出码非 0 / 起不来都算 false，绝不抛 */
-function runOsascriptDefault(script: string): Promise<boolean> {
+/**
+ * 「发什么」：平台 → argv 的纯函数。平台分支只在这里。
+ * R1/R2：Windows 没有通知后端，返回空 argv；Linux 用 notify-send，闲参数一概不加。
+ */
+export function notifyCommand(
+  platform: NodeJS.Platform,
+  title: string,
+  body: string,
+): string[] {
+  switch (platform) {
+    case 'darwin':
+      return ['osascript', '-e', notificationScript(title, body)]
+    case 'linux':
+      return ['notify-send', title, body]
+    default:
+      return []
+  }
+}
+
+/** 默认实现：spawn argv，退出码非 0 / 起不来都算 false，绝不抛 */
+export function runNotifyDefault(argv: string[]): Promise<boolean> {
+  if (argv.length === 0) return Promise.resolve(false)
   return new Promise((resolve) => {
     let settled = false
     const finish = (ok: boolean): void => {
@@ -35,7 +54,7 @@ function runOsascriptDefault(script: string): Promise<boolean> {
       resolve(ok)
     }
     try {
-      const child = spawn('osascript', ['-e', script], { stdio: 'ignore' })
+      const child = spawn(argv[0]!, argv.slice(1), { stdio: 'ignore' })
       child.on('error', () => finish(false))
       child.on('close', (code) => finish(code === 0))
     } catch {
@@ -65,9 +84,10 @@ export async function notifyUpgraded(
   to: string,
   deps?: Partial<NotifyDeps>,
 ): Promise<boolean> {
-  const run = deps?.runOsascript ?? runOsascriptDefault
+  const run = deps?.runNotify ?? runNotifyDefault
   try {
-    return (await run(notificationScript(to))) === true
+    const argv = notifyCommand(process.platform, NOTIFICATION_TITLE, `已升级到 ${to}，进程已重启`)
+    return (await run(argv)) === true
   } catch {
     return false
   }
