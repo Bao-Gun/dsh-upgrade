@@ -4,7 +4,9 @@ package-lock.json
 __pycache__/
 .venv/
 dist/
-/lib/
+# git 源安装只拿这个 commit 的 tar、不跑构建：产物 js 必须入库，sourcemap 不必
+/lib/*
+!/lib/*.js
 build/
 .env
 .env.*

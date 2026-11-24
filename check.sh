@@ -32,6 +32,14 @@ for t in specs/changes/*/tasks.md; do
   fi
 done
 
+# ③.5 发布契约：装得上才算插件。dsh.bundle.patch 缺了就是 not-a-bundle，路径拼错也是
+patch=$(node -e 'const p=require("./package.json");process.stdout.write((p.dsh&&p.dsh.bundle&&p.dsh.bundle.patch)||"")' 2>/dev/null)
+if [ -z "$patch" ]; then
+  bad "package.json 没有 dsh.bundle.patch，装上去会报 not-a-bundle"
+else
+  [ -f "$patch" ] || bad "dsh.bundle.patch 指向的文件不存在: [object Object]"
+fi
+
 # ④ 构建 / 类型检查 / 测试，一条挂了不挡其它条
 npm run build || bad "构建失败"
 # lib/index.js 与 lib/client.js 是 package.json exports 和安装脚本 REQUIRED_ARTIFACTS 的承诺：tsup 静默少产物要红
