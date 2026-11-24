@@ -83,3 +83,4 @@ dsh plugin --profile web add 'github:Bao-Gun/dsh-upgrade#ab4f8cd461cdf735b758385
 - 27.4s 装完（`Packages: +1 -9`），profile 里落成 `github:Bao-Gun/dsh-upgrade#ab4f8cd…`，插件 `package.json` 报 `0.2.1`。
 - `lib/client.js` / `lib/index.js` 的 sha256 与本机仓库当时逐字节一致（`0.2.1` 的 `lib/client.js`：`d9eb365c…`，`lib/index.js`：`b2fe37e4…`）。这两串只在 `0.2.1` 这个 commit 上成立：之后本机仓库又改过 `src/client/panel.ts`（commit 版本名显示），`lib/client.js` 已变，重装前先重算哈希，别拿旧串当验收标准。
 - 装完不动服务：`/health` 200、`/dsh-upgrade/api/status` 200、`dsh-watchdog.service` active。这次只改了客户端 bundle，刷新页面即可，不需要重启 dsh web。
+- 0.2.2 起前端多打一个 `GET /dsh-upgrade/api/plugin-version`（把 40 位 commit 换成版本号，见 `docs/architecture.md` 的「版本名」行）：这一段**新增了服务端路由**，所以是在 NAS 上升级插件后仍需重启一次 dsh web 的唯一变化；不重启时那个请求 404，面板保留短哈希，升级本身照常。

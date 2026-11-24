@@ -6,6 +6,7 @@ import { runUpgrade, type UpgradeEvent } from '../src/server/upgrade'
 import type { RegistryInfo } from '../src/server/host'
 import {
   CHECK_PATH,
+  PLUGIN_VERSION_PATH,
   RELEASES_PATH,
   STATUS_PATH,
   UPGRADE_PATH,
@@ -63,6 +64,7 @@ function baseDeps(overrides: Partial<RouteDeps> = {}): RouteDeps {
       emit({ phase: 'done', message: '已升级，需重启生效', done: true })
       return { ok: true }
     }) as unknown as typeof runUpgrade,
+    pluginVersions: vi.fn(async () => ({ installed: '0.2.1', latest: '0.2.2' })),
     nodeVersion: () => '26.7.0',
     now: () => NOW,
     ...overrides,
@@ -76,6 +78,7 @@ const METHOD_OF: Record<string, string> = {
   [CHECK_PATH]: 'POST',
   [RELEASES_PATH]: 'GET',
   [UPGRADE_PATH]: 'POST',
+  [PLUGIN_VERSION_PATH]: 'GET',
 }
 
 /** 假 ctx：照真实宿主接线（effect + webServer.register）收集路由表 */
@@ -460,3 +463,48 @@ describe('GET /releases', () => {
     expect(jsonOf(state).code).toBe('INVALID_RANGE')
   })
 })
+
+describe('GET /plugin-version', () => {
+  test('把 name + commit 交给解析器，原样回版本对', async () => {
+    const versionDeps = baseDeps({
+      pluginVersions: vi.fn(async () => ({ installed: '0.2.1', latest: '0.2.2' })),
+    })
+    const versionRoute = setup(versionDeps)(PLUGIN_VERSION_PATH)
+    const versionRes = fakeRes()
+    const commit = 'ab4f8cd461cdf735b758385407a11679a60c0e86'
+
+    await versionRoute.handler(
+      request('GET', PLUGIN_VERSION_PATH + '?name=dsh-upgrade&commit=' + commit),
+      versionRes.res,
+    )
+
+    expect(versionRes.state.status).toBe(200)
+    expect(jsonOf(versionRes.state)).toEqual({ installed: '0.2.1', latest: '0.2.2' })
+    expect(versionDeps.pluginVersions).toHaveBeenCalledWith('dsh-upgrade', commit)
+  })
+
+  test('缺 name/commit → 400，且不去查', async () => {
+    const missingDeps = baseDeps()
+    const missingRoute = setup(missingDeps)(PLUGIN_VERSION_PATH)
+    const missingRes = fakeRes()
+
+    await missingRoute.handler(request('GET', PLUGIN_VERSION_PATH + '?name=dsh-upgrade'), missingRes.res)
+
+    expect(missingRes.state.status).toBe(400)
+    expect(jsonOf(missingRes.state).code).toBe('INVALID_QUERY')
+    expect(missingDeps.pluginVersions).not.toHaveBeenCalled()
+  })
+
+  test('缺 x-dsh-upgrade: 1 → 403', async () => {
+    const guardRoute = setup(baseDeps())(PLUGIN_VERSION_PATH)
+    const guardRes = fakeRes()
+
+    await guardRoute.handler(
+      request('GET', PLUGIN_VERSION_PATH + '?name=dsh-upgrade&commit=' + 'a'.repeat(40), { guard: false }),
+      guardRes.res,
+    )
+
+    expect(guardRes.state.status).toBe(403)
+  })
+})
+

@@ -49,6 +49,7 @@ const STATUS_PATH = '/dsh-upgrade/api/status'
 const CHECK_PATH = '/dsh-upgrade/api/check'
 const RELEASES_PATH = '/dsh-upgrade/api/releases'
 const UPGRADE_PATH = '/dsh-upgrade/api/upgrade'
+const PLUGIN_VERSION_PATH = '/dsh-upgrade/api/plugin-version'
 
 const RESTART_STATUS_PATH = '/dsh-restart/api/status'
 const RESTART_PRECHECK_PATH = '/dsh-restart/api/precheck'
@@ -934,6 +935,7 @@ function renderPlugins(view: View): void {
     const row = createPluginRow(view, update)
     view.rows.set(update.name, row)
     view.pluginList.appendChild(row.root)
+    void labelCommitVersions(view, row, update)
   }
 }
 
@@ -959,6 +961,43 @@ const FULL_COMMIT = /^[0-9a-f]{40}$/i
 export function compactVersion(value: string): string {
   return FULL_COMMIT.test(value) ? value.slice(0, 7) : value
 }
+
+/**
+ * 市场对钉死的 commit 只说得出哈希。再问一次自己的服务端：它读 profile 里
+ * 已装包的 package.json 和该 commit 的 package.json，能拿到真版本号就换掉文案。
+ * 任何一步失败都保持短哈希——这一行本来就能看，不值得为它报错。
+ */
+async function labelCommitVersions(view: View, row: PluginRowView, update: PluginUpdate): Promise<void> {
+  if (!FULL_COMMIT.test(update.from) || !FULL_COMMIT.test(update.to)) return
+  const initial = row.version.textContent
+  const url = joinUrl(view.options.apiBase ?? '', PLUGIN_VERSION_PATH) +
+    '?name=' + encodeURIComponent(update.name) + '&commit=' + update.to
+  let reply: JsonReply
+  try {
+    reply = await requestJson(fetchOf(view.doc), url, {
+      method: 'GET',
+      credentials: 'same-origin',
+      headers: { ...HOST_HEADERS },
+    })
+  } catch {
+    return
+  }
+  if (!reply.ok) return
+  const body = reply.body
+  if (typeof body !== 'object' || body === null) return
+  const versions = body as Record<string, unknown>
+  const installed = asString(versions.installed)
+  const latest = asString(versions.latest)
+  if (installed === '' || latest === '') return
+  // 期间列表可能已重画、或这一轮已经升级过：不是刚画的那一行就别覆盖。
+  if (view.rows.get(update.name) !== row) return
+  if (row.version.textContent !== initial) return
+  row.version.textContent = installed === latest
+    ? installed + '（仅提交变化）'
+    : installed + ' → ' + latest
+  row.version.title = update.from + ' → ' + update.to
+}
+
 
 /**
  * 两行式：第一行名字与版本对，第二行是这一行自己的状态与进度。

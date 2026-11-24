@@ -544,6 +544,75 @@ describe('插件段', () => {
     closePanel()
   })
 
+  test('两个都是 40 位 commit 时，用服务端查到的版本号替换短哈希', async () => {
+    const from = '08f9424697e531a03918e3c60298366f2fb93b50'
+    const to = 'ab4f8cd461cdf735b758385407a11679a60c0e86'
+    const calls = serve({
+      ...fullRoutes(),
+      'GET /dsh-market/api/v1/updates/summary': () => jsonResponse({
+        schema: 1,
+        checked: 1,
+        packages: [{ name: 'dsh-upgrade', source: 'github', installedVersion: from, latestVersion: to }],
+      }),
+      'GET /dsh-upgrade/api/plugin-version': () => jsonResponse({ installed: '0.2.1', latest: '0.2.2' }),
+    })
+    await openPanel(document)
+    const version = document.querySelector<HTMLElement>('.dshu-plugin[data-name="dsh-upgrade"] .dshu-plugin-version')
+    await vi.waitFor(() => expect(version?.textContent).toBe('0.2.1 → 0.2.2'))
+    expect(version?.title).toBe(from + ' → ' + to)
+    const asked = calls.find((call) => pathOf(call.url) === '/dsh-upgrade/api/plugin-version')
+    expect(asked?.headers['x-dsh-upgrade']).toBe('1')
+    closePanel()
+  })
+
+  test('两端版本相同时写「仅提交变化」，不装作有版本升级', async () => {
+    const from = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    const to = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+    serve({
+      ...fullRoutes(),
+      'GET /dsh-market/api/v1/updates/summary': () => jsonResponse({
+        schema: 1,
+        checked: 1,
+        packages: [{ name: 'dsh-upgrade', source: 'github', installedVersion: from, latestVersion: to }],
+      }),
+      'GET /dsh-upgrade/api/plugin-version': () => jsonResponse({ installed: '0.2.1', latest: '0.2.1' }),
+    })
+    await openPanel(document)
+    const version = document.querySelector<HTMLElement>('.dshu-plugin[data-name="dsh-upgrade"] .dshu-plugin-version')
+
+    await vi.waitFor(() => expect(version?.textContent).toBe('0.2.1（仅提交变化）'))
+    closePanel()
+  })
+
+  test('查不到版本号就保持短哈希，不报错', async () => {
+    const from = 'cccccccccccccccccccccccccccccccccccccccc'
+    const to = 'dddddddddddddddddddddddddddddddddddddddd'
+    serve({
+      ...fullRoutes(),
+      'GET /dsh-market/api/v1/updates/summary': () => jsonResponse({
+        schema: 1,
+        checked: 1,
+        packages: [{ name: 'dsh-upgrade', source: 'github', installedVersion: from, latestVersion: to }],
+      }),
+      'GET /dsh-upgrade/api/plugin-version': () => jsonResponse({ installed: null, latest: null }),
+    })
+    await openPanel(document)
+    const version = document.querySelector<HTMLElement>('.dshu-plugin[data-name="dsh-upgrade"] .dshu-plugin-version')
+
+    await vi.waitFor(() => expect(version?.textContent).toBe('ccccccc → ddddddd'))
+    expect(document.querySelector('.dshu-error')).toBeNull()
+    closePanel()
+  })
+
+  test('版本本来就是版本号时不发这个请求', async () => {
+    const calls = serve(fullRoutes())
+    await openPanel(document)
+    const asked = calls.filter((call) => pathOf(call.url) === '/dsh-upgrade/api/plugin-version')
+    expect(asked).toHaveLength(0)
+    closePanel()
+  })
+
+
   test('running 时进度块露出来，终态后收回', async () => {
     serve(fullRoutes())
     await openPanel(document)

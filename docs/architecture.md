@@ -17,19 +17,20 @@
 | 通知 | `src/server/notify.ts` | 升级开始前写 pending（R22），下一次启动发「DSH 已升级」并结算，7 天过期；通知这一处的平台分支：darwin → `osascript` + AppleScript（标题与正文都做双引号转义）、linux → `notify-send`、其它 → 空 argv 静默返回 false；对调用方永不抛 | `routes`（markPending）、`index`（settlePending） |
 | 调查 | `src/server/survey.ts` | 路由和 agent 工具共用的一份判定：当前版本、目标版本、可升级列表、是否被 engines 拦住 | `routes`、`tools` |
 | 单飞锁 | `src/server/lock.ts` | 进程内单飞：HTTP 与 agent 工具同一时刻只允许一个升级在跑 | `routes`、`tools` |
-| 路由 | `src/server/routes.ts` | 四个端点（status / check / releases / upgrade）+ 请求门（方法、`x-dsh-upgrade:1`、同源 Origin）+ NDJSON 进度；status 与 check 都读 last.json，把「装完没重启」报成 `restartRequired`（重查不会把它抹掉）；注册走 `ctx.effect` + `webServer.register` | `index`；页面与 agent 经 HTTP 调用 |
+| 版本名 | `src/server/plugininfo.ts` | 把市场给的 40 位 commit 翻成版本号：已装版本读 `<profile>/node_modules/<name>/package.json`，目标版本按 profile 里该包的 spec 认出 GitHub 仓库、再取 `<commit>/package.json`（先 raw.githubusercontent，失败退 ghproxy 镜像）；同一 commit 缓存 10 分钟；包名与 commit 先过正则，越界一律不读文件；任何一步失败只回 null，绝不影响升级 | `routes` |
+| 路由 | `src/server/routes.ts` | 五个端点（status / check / releases / upgrade / plugin-version）+ 请求门（方法、`x-dsh-upgrade:1`、同源 Origin）+ NDJSON 进度；status 与 check 都读 last.json，把「装完没重启」报成 `restartRequired`（重查不会把它抹掉）；注册走 `ctx.effect` + `webServer.register` | `index`；页面与 agent 经 HTTP 调用 |
 | 工具 | `src/server/tools.ts` | 两个 agent 工具：`dsh_upgrade_check`（只读）与 `dsh_upgrade`（会动安装目录）；成功后写 last.json 的 `restartRequired` 并只回这个标记，不写 pending、不自己重启 | `index` 注册；agent 调用 |
 | 市场适配 | `src/client/market.ts` | 浏览器侧适配 dshmarket v1 的 summary / start / poll 协议，纯映射，按 code 区分市场不可用 / 操作用未知 / 未授权 / 更新失败；running 时带回 `progress`（percent/detail，只给 done/total 时自己折算）与 `wait`（排队原因）；兜底文案 `UNAVAILABLE_MESSAGE` 对外导出，批量队列复用同一句 | `panel`、`batch` |
 | 批量升级 | `src/client/batch.ts` | 串行执行全部可更新插件：按顺序 POST 起包、GET 轮询、3 分钟没有推进就判卡住、单包失败 / 回滚 / 卡住后继续下一个，宿主 409 或叫停时把剩余记成 skipped 提前收尾，汇总 succeeded / failed / skipped 与 restartRequired；只发事件，不碰 DOM | `panel` |
 | 注入 | `src/client/inject.ts` | 在底栏挂升级图标：三级退路（dshmarket 底栏 → sidebar.footer → settings.launcher）+ MutationObserver 重挂；`setEntryState` 按状态切角标 / 忙碌态，**没更新时整颗隐藏**（`known === false` 即查询失败时保持可见，别把面板锁死） | `src/client/index.ts` |
-| 面板 | `src/client/panel.ts` | 两段式面板：当前 / 可升级版本、更新内容折叠、NDJSON 进度；外壳不滚，`.dshu-head` 固定、只有 `.dshu-body` 滚动；本体阶段条按 `PHASE_LABELS` 顺序折算百分比；插件段一个「全部升级」按钮 + 两行式插件行（第一行名字 / 版本，第二行自己的进度条与**行内**文案，单包升级按钮已移除）+ 结束后的「重启 DSH」按钮（二次确认）；行内失败原因不往底部抛红条，长文压成中文首句、全文进 title；版本对是 40 位 commit 时只显示前 7 位、全文进 title（索引装的插件被市场按 commit 比较，见 `docs/gotchas.md`）；操作 3 分钟没有任何推进就解锁按钮并写明卡在哪（等会话结束 / 还在后台跑），不把按钮钉死；升级完成后调 dsh-restart 的 precheck → restart，404 时提示手动重启；status 报 `restartRequired` 时提示「需重启」而不是「已是最新」 | `src/client/index.ts` |
+| 面板 | `src/client/panel.ts` | 两段式面板：当前 / 可升级版本、更新内容折叠、NDJSON 进度；外壳不滚，`.dshu-head` 固定、只有 `.dshu-body` 滚动；本体阶段条按 `PHASE_LABELS` 顺序折算百分比；插件段一个「全部升级」按钮 + 两行式插件行（第一行名字 / 版本，第二行自己的进度条与**行内**文案，单包升级按钮已移除）+ 结束后的「重启 DSH」按钮（二次确认）；行内失败原因不往底部抛红条，长文压成中文首句、全文进 title；版本对是 40 位 commit 时先显示前 7 位、全文进 title，再向 `/api/plugin-version` 要真版本号，拿到就换成 `0.2.1 → 0.2.2`（两端版本相同时写「仅提交变化」），拿不到就留着短哈希（索引装的插件被市场按 commit 比较，见 `docs/gotchas.md`）；操作 3 分钟没有任何推进就解锁按钮并写明卡在哪（等会话结束 / 还在后台跑），不把按钮钉死；升级完成后调 dsh-restart 的 precheck → restart，404 时提示手动重启；status 报 `restartRequired` 时提示「需重启」而不是「已是最新」 | `src/client/index.ts` |
 | 客户端入口 | `src/client/index.ts` | 浏览器入口 `apply`：挂图标 → `probeEntryState` 拉一次决定图标显隐 → 每 5 分钟（`ENTRY_REFRESH_MS`）静默复查，出新版本时图标自己冒出来 → 打开面板；卸载时 teardown 并清掉定时器 | 宿主客户端插件加载器 |
 
 ## 数据流
 
 ### 浏览器 → 服务端
 
-点底栏图标 → `panel` 先 GET `/dsh-upgrade/api/status`（带 `x-dsh-upgrade:1`）拿当前 / 目标版本；POST `/check` 与 GET `/releases` 只刷新展示；点「升级」POST `/upgrade`，读回 NDJSON 进度（precheck / backup / install / verify / done / fail）。
+点底栏图标 → `panel` 先 GET `/dsh-upgrade/api/status`（带 `x-dsh-upgrade:1`）拿当前 / 目标版本；插件行两端都是 40 位 commit 时再 GET `/api/plugin-version?name=&commit=`，把短哈希换成版本号；POST `/check` 与 GET `/releases` 只刷新展示；点「升级」POST `/upgrade`，读回 NDJSON 进度（precheck / backup / install / verify / done / fail）。
 
 ### 插件：全部升级 → runBatch → dshmarket → 汇总 → 可选重启
 

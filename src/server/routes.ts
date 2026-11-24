@@ -1,7 +1,8 @@
 /**
- * 四个 HTTP 端点 + 请求门 + 单飞锁。
+ * 五个 HTTP 端点 + 请求门 + 单飞锁。
  *
- * 这里是插件唯一的网络面：页面（同源 fetch）读状态、查更新、拉更新内容、发升级。
+ * 这里是插件唯一的网络面：页面（同源 fetch）读状态、查更新、拉更新内容、发升级、
+ * 把某个插件的两个 commit 翻成版本号。
  * 请求门与 dsh-restart 同风格——方法只收 GET/POST、必须带 x-dsh-upgrade: 1，
  * 带 Origin 时必须与 Host 一致；不合格一律 403，且不回显任何内部路径。
  *
@@ -15,6 +16,7 @@ import {
   type HostInfo,
 } from './host'
 import { releaseUpgrade, tryAcquireUpgrade } from './lock'
+import { pluginVersions } from './plugininfo'
 import { markPending } from './notify'
 import { fetchReleases, type ReleaseEntry } from './releases'
 import { readRestartRequired, rootDir, writeLast } from './state'
@@ -25,6 +27,7 @@ export const STATUS_PATH = '/dsh-upgrade/api/status'
 export const CHECK_PATH = '/dsh-upgrade/api/check'
 export const RELEASES_PATH = '/dsh-upgrade/api/releases'
 export const UPGRADE_PATH = '/dsh-upgrade/api/upgrade'
+export const PLUGIN_VERSION_PATH = '/dsh-upgrade/api/plugin-version'
 
 /** 跨站请求带不上这个头（会触发预检，宿主不认 OPTIONS）。 */
 const GUARD_HEADER = 'x-dsh-upgrade'
@@ -69,6 +72,7 @@ export type RouteDeps = {
   readTargetManifest?: typeof readTargetManifest
   fetchReleases?: typeof fetchReleases
   runUpgrade?: typeof runUpgrade
+  pluginVersions?: typeof pluginVersions
   nodeVersion?: () => string
   now?: () => number
 }
@@ -94,6 +98,7 @@ export function registerUpgradeRoutes(ctx: UpgradeRouteContext, overrides: Route
     [CHECK_PATH, 'POST', checkHandler(deps)],
     [RELEASES_PATH, 'GET', releasesHandler(deps)],
     [UPGRADE_PATH, 'POST', upgradeHandler(deps)],
+    [PLUGIN_VERSION_PATH, 'GET', pluginVersionHandler(deps)],
   ]
 
   for (const [path, method, handler] of handlers) {
@@ -120,6 +125,7 @@ function resolveDeps(overrides: RouteDeps): ResolvedDeps {
     readTargetManifest: overrides.readTargetManifest ?? readTargetManifest,
     fetchReleases: overrides.fetchReleases ?? fetchReleases,
     runUpgrade: overrides.runUpgrade ?? runUpgrade,
+    pluginVersions: overrides.pluginVersions ?? pluginVersions,
     nodeVersion: overrides.nodeVersion ?? (() => process.versions.node),
     now: overrides.now ?? (() => Date.now()),
   }
@@ -219,6 +225,22 @@ function releasesHandler(deps: ResolvedDeps): RouteHandler {
       // fetchReleases 自己永不抛；万一注入的实现抛了，更新内容也只是装饰，降级不报错。
       respondJson(res, 200, { releases: [] as ReleaseEntry[], degraded: true })
     }
+  }
+}
+
+function pluginVersionHandler(deps: ResolvedDeps): RouteHandler {
+  return async (req, res) => {
+    if (!guard(req, res, 'GET')) return
+    const query = queryOf(req.url)
+    const name = query.get('name') ?? ''
+    const commit = query.get('commit') ?? ''
+    if (name === '' || commit === '') {
+      respondJson(res, 400, { code: 'INVALID_QUERY', message: '缺少 name 或 commit 参数' })
+      return
+    }
+    // 版本号只是锦上添花：查不到就回 null，让面板显示短哈希，绝不影响升级。
+    const versions = await deps.pluginVersions(name, commit)
+    respondJson(res, 200, versions)
   }
 }
 

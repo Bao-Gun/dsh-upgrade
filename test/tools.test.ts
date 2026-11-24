@@ -11,7 +11,13 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { apply, inject as pluginInject, name as pluginName } from '../src/index'
 import type { RegistryInfo } from '../src/server/host'
 import { releaseUpgrade, tryAcquireUpgrade } from '../src/server/lock'
-import { CHECK_PATH, RELEASES_PATH, STATUS_PATH, UPGRADE_PATH } from '../src/server/routes'
+import {
+  CHECK_PATH,
+  PLUGIN_VERSION_PATH,
+  RELEASES_PATH,
+  STATUS_PATH,
+  UPGRADE_PATH,
+} from '../src/server/routes'
 import { readLast, readRestartRequired } from '../src/server/state'
 import { dshUpgrade, dshUpgradeCheck, registerTools, type ToolDeps } from '../src/server/tools'
 import type { UpgradeEvent } from '../src/server/upgrade'
@@ -316,7 +322,7 @@ describe('插件入口', () => {
     expect(pluginInject).toEqual(['webServer'])
   })
 
-  test('有 webServer 时四条路由都挂上', async () => {
+  test('有 webServer 时五条路由都挂上', async () => {
     const paths: string[] = []
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const ctx = {
@@ -333,7 +339,13 @@ describe('插件入口', () => {
 
     try {
       expect(() => apply(ctx as unknown as Parameters<typeof apply>[0])).not.toThrow()
-      expect(paths).toEqual([STATUS_PATH, CHECK_PATH, RELEASES_PATH, UPGRADE_PATH])
+      expect(paths).toEqual([
+        STATUS_PATH,
+        CHECK_PATH,
+        RELEASES_PATH,
+        UPGRADE_PATH,
+        PLUGIN_VERSION_PATH,
+      ])
       await flushSettle()
     } finally {
       warn.mockRestore()
